@@ -1,16 +1,14 @@
 LOAD 'plpgsql';
 CREATE EXTENSION  IF NOT EXISTS plpgsql_check;
-NOTICE:  extension "plpgsql_check" already exists, skipping
+
 -- check event trigger function 
 create or replace function f1() returns event_trigger as $$
 BEGIN
     RAISE NOTICE 'test_event_trigger: % %', tg_event, tg_tag;
 END
 $$ language plpgsql;
+
 select * from plpgsql_check_function_tb('f1()');
- functionid | lineno | statement | sqlstate | message | detail | hint | level | position | query | context 
-------------+--------+-----------+----------+---------+--------+------+-------+----------+-------+---------
-(0 rows)
 
 -- should fail
 create or replace function f1() returns event_trigger as $$
@@ -18,23 +16,20 @@ BEGIN
     RAISE NOTICE 'test_event_trigger: % %', tg_event, tg_tagX;
 END
 $$ language plpgsql;
+
 select * from plpgsql_check_function_tb('f1()');
- functionid | lineno | statement | sqlstate |             message             | detail | hint | level | position |     query      | context 
-------------+--------+-----------+----------+---------------------------------+--------+------+-------+----------+----------------+---------
- f1         |      3 | RAISE     | 42703    | column "tg_tagx" does not exist |        |      | error |        8 | SELECT tg_tagX | 
-(1 row)
 
 drop function f1();
+
+
 -- check event trigger function 
 create or replace function f1() returns event_trigger as $$
 BEGIN
     RAISE NOTICE 'test_event_trigger: % %', tg_event, tg_tag;
 END
 $$ language plpgsql;
+
 select * from plpgsql_check_function('f1()');
- plpgsql_check_function 
-------------------------
-(0 rows)
 
 -- should fail
 create or replace function f1() returns event_trigger as $$
@@ -42,16 +37,13 @@ BEGIN
     RAISE NOTICE 'test_event_trigger: % %', tg_event, tg_tagX;
 END
 $$ language plpgsql;
+
 select * from plpgsql_check_function('f1()');
-               plpgsql_check_function                
------------------------------------------------------
- error:42703:3:RAISE:column "tg_tagx" does not exist
- Query: SELECT tg_tagX
- --            ^
-(3 rows)
 
 drop function f1();
+
 create table t1tab(a int, b int);
+
 create or replace function f1()
 returns setof t1tab as $$
 begin
@@ -59,10 +51,8 @@ begin
   return;
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('f1()', performance_warnings => true);
- plpgsql_check_function 
-------------------------
-(0 rows)
 
 create or replace function f1()
 returns setof t1tab as $$
@@ -71,12 +61,8 @@ begin
   return;
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('f1()', performance_warnings => true);
-                               plpgsql_check_function                               
-------------------------------------------------------------------------------------
- error:42804:3:RETURN NEXT:returned record type does not match expected record type
- Detail: Returned type numeric does not match expected type integer in column 1.
-(2 rows)
 
 create or replace function f1()
 returns setof t1tab as $$
@@ -86,10 +72,8 @@ begin
   return;
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('f1()', performance_warnings => true);
- plpgsql_check_function 
-------------------------
-(0 rows)
 
 create or replace function f1()
 returns setof t1tab as $$
@@ -99,33 +83,27 @@ begin
   return;
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('f1()', performance_warnings => true);
-                               plpgsql_check_function                               
-------------------------------------------------------------------------------------
- error:42804:4:RETURN NEXT:returned record type does not match expected record type
- Detail: Returned type numeric does not match expected type integer in column 1.
-(2 rows)
 
 drop function f1();
+
 create table t1(a int, b int);
+
 create or replace function fx()
 returns t2 as $$
 begin
   return (10,20,30)::t1;
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('fx()', performance_warnings => true);
-               plpgsql_check_function               
-----------------------------------------------------
- error:42846:3:RETURN:cannot cast type record to t1
- Query: SELECT (10,20,30)::t1
- --                      ^
- Detail: Input has too many columns.
-(4 rows)
 
 drop function fx();
+
 drop table t1tab;
 drop table t1;
+
 create or replace function fx()
 returns void as $$
 begin
@@ -133,16 +111,8 @@ begin
   assert false, (select boo from boo limit 1);
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('fx()', fatal_errors => false);
-               plpgsql_check_function               
-----------------------------------------------------
- error:42P01:3:ASSERT:relation "foo" does not exist
- Query: SELECT exists(select * from foo)
- --                                 ^
- error:42P01:4:ASSERT:relation "boo" does not exist
- Query: SELECT (select boo from boo limit 1)
- --                             ^
-(6 rows)
 
 create or replace function ml_trg()
 returns trigger as $$
@@ -173,11 +143,8 @@ exception
     if TG_OP = 'DELETE' then return OLD; else return NEW; end if;
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('ml_trg()', 'ml', performance_warnings := true);
-                          plpgsql_check_function                          
---------------------------------------------------------------------------
- error:42703:13:SQL statement:record "new" has no field "status_from_xxx"
-(1 row)
 
 create or replace function fx2()
 returns void as $$
@@ -187,13 +154,11 @@ begin
   select pa.pa_id into _pa.pa_id from pa limit 1;
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('fx2()', performance_warnings := true);
-                 plpgsql_check_function                  
----------------------------------------------------------
- warning extra:00000:2:DECLARE:never read variable "_pa"
-(1 row)
 
 drop function fx2();
+
 create or replace function fx2()
 returns void as $$
 declare _pa pa;
@@ -202,17 +167,16 @@ begin
   _pa.pa_id := (select pa.pa_id from pa limit 1);
 end;
 $$ language plpgsql;
+
 select * from plpgsql_check_function('fx2()', performance_warnings := true);
-                 plpgsql_check_function                  
----------------------------------------------------------
- warning extra:00000:2:DECLARE:never read variable "_pa"
-(1 row)
 
 drop function fx2();
+
 create type _exception_type as (
   state text,
   message text,
   detail text);
+
 create or replace function f1()
 returns void as $$
 declare
@@ -227,17 +191,10 @@ exception when others then
         _exception.hint = PG_EXCEPTION_HINT;
 end;
 $$ language plpgsql;
+
 select f1();
- f1 
-----
- 
-(1 row)
 
 select * from plpgsql_check_function_tb('f1()');
- functionid | lineno |        statement        | sqlstate |                 message                 | detail | hint | level | position | query | context 
-------------+--------+-------------------------+----------+-----------------------------------------+--------+------+-------+----------+-------+---------
- f1         |      7 | GET STACKED DIAGNOSTICS | 42703    | record "_exception" has no field "hint" |        |      | error |          |       | 
-(1 row)
 
 create or replace function f1()
 returns void as $$
@@ -252,24 +209,20 @@ exception when others then
         _exception.detail = PG_EXCEPTION_DETAIL;
 end;
 $$ language plpgsql;
+
 select f1();
- f1 
-----
- 
-(1 row)
 
 select * from plpgsql_check_function_tb('f1()');
- functionid | lineno | statement | sqlstate |             message              | detail | hint |     level     | position | query | context 
-------------+--------+-----------+----------+----------------------------------+--------+------+---------------+----------+-------+---------
- f1         |      3 | DECLARE   | 00000    | never read variable "_exception" |        |      | warning extra |          |       | 
-(1 row)
 
 drop function f1();
+
 drop type _exception_type;
+
 create type _exception_type as (
   state text,
   message text,
   detail text);
+
 create or replace function f1()
 returns void as $$
 declare
@@ -284,17 +237,98 @@ exception when others then
         _exception.hint = PG_EXCEPTION_HINT;
 end;
 $$ language plpgsql;
+
 select f1();
- f1 
-----
- 
-(1 row)
 
 select * from plpgsql_check_function('f1()');
-                            plpgsql_check_function                             
--------------------------------------------------------------------------------
- error:42703:7:GET STACKED DIAGNOSTICS:record "_exception" has no field "hint"
-(1 row)
 
 drop function f1();
 drop type _exception_type;
+
+create or replace procedure proc(a int)
+as $$
+begin
+end;
+$$ language plpgsql;
+
+call proc(10);
+
+select * from plpgsql_check_function('proc(int)');
+
+create or replace procedure testproc()
+as $$
+begin
+  call proc(10);
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+-- should to fail
+create or replace procedure testproc()
+as $$
+begin
+  call proc((select count(*) from pg_class));
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+drop procedure proc(int);
+
+create procedure proc(in a int, inout b int, in c int)
+as $$
+begin
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('proc(int,int, int)');
+
+create or replace procedure proc(in a int, inout b int, in c int)
+as $$
+begin
+  b := a + c;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('proc(int,int, int)');
+
+create or replace procedure testproc()
+as $$
+declare r int;
+begin
+  call proc(10, r, 20);
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+-- should to fail
+create or replace procedure testproc()
+as $$
+declare r int;
+begin
+  call proc(10, r + 10, 20);
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+create or replace procedure testproc(inout r int)
+as $$
+begin
+  call proc(10, r, 20);
+end;
+$$ language plpgsql;
+
+call testproc(10);
+
+select * from plpgsql_check_function('testproc(int)');

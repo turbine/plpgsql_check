@@ -1619,3 +1619,770 @@ select * from plpgsql_check_function('fxx()');
 select * from plpgsql_check_function('fxx()', extra_warnings := false);
 
 drop function fxx();
+
+create or replace function fxx(in a int, in b int, out c int, out d int)
+as $$
+begin
+  c := a;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fxx(int, int)');
+
+create or replace function fxx(in a int, in b int, out c int, out d int)
+as $$
+begin
+  c := d;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fxx(int, int)');
+
+
+create type ct as (a int, b int);
+
+create or replace function fxx(a ct, b ct, OUT c ct, OUT d ct)
+as $$
+begin
+  c.a := a.a;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fxx(ct, ct)');
+
+create or replace function fxx(a ct, b ct, OUT c ct, OUT d ct)
+as $$
+begin
+  c.a := d.a;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fxx(ct, ct)');
+
+create or replace function tx(a int)
+returns int as $$
+declare a int; ax int;
+begin
+  declare ax int;
+  begin
+    ax := 10;
+  end;
+  a := 10;
+  return 20;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('tx(int)');
+
+create type xt as (a int, b int, c int);
+create or replace function fx_xt(out x xt)
+as $$
+declare l xt;
+a int;
+begin
+  return;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_xt()');
+
+drop function fx_xt();
+
+create or replace function fx_xt(out x xt)
+as $$
+declare l xt;
+a int;
+begin
+  x.c := 1000;
+  return;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_xt()');
+
+drop function fx_xt();
+
+create or replace function fx_xt(out x xt, out y xt)
+as $$
+declare c1 xt; c2 xt;
+begin
+  return;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_xt()');
+
+drop function fx_xt();
+
+create or replace function fx_xt(out x xt, out y xt)
+as $$
+declare c1 xt; c2 xt;
+begin
+  x.a := 100;
+  y := row(10,20,30);
+  return;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_xt()');
+
+drop function fx_xt();
+
+create or replace function fx_xt(out x xt, out z int)
+as $$
+begin
+  return;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_xt()');
+
+drop function fx_xt();
+
+drop type xt;
+
+-- missing RETURN
+create or replace function fx_flow()
+returns int as $$
+begin
+  raise notice 'kuku';
+end;
+$$ language plpgsql;
+
+select fx_flow();
+select * from plpgsql_check_function('fx_flow()');
+
+-- ok
+create or replace function fx_flow()
+returns int as $$
+declare a int;
+begin
+  if a > 10 then
+    return a;
+  end if;
+  return 10;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_flow()');
+
+-- dead code
+create or replace function fx_flow()
+returns int as $$
+declare a int;
+begin
+  if a > 10 then
+    return a;
+  else
+    return a + 1;
+  end if;
+  return 10;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_flow()');
+
+-- missing return
+create or replace function fx_flow()
+returns int as $$
+declare a int;
+begin
+  if a > 10 then
+    return a;
+  end if;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx_flow()');
+
+drop function fx_flow();
+
+create or replace function fx_flow(in p_param1 integer)
+returns text as
+$$
+declare
+  z1 text;
+begin
+  if p_param1 is not null then
+    z1 := '1111';
+    return z1;
+  else
+    z1 := '222222';
+  end if;
+  return z1;
+end;
+$$
+language plpgsql stable;
+
+select * from plpgsql_check_function_tb('fx_flow(integer)');
+
+create or replace function fx_flow(in p_param1 integer)
+returns text as
+$$
+declare
+  z1 text;
+begin
+  if p_param1 is not null then
+    z1 := '1111';
+    return z1;
+  else
+    z1 := '222222';
+    raise exception 'stop';
+  end if;
+  return z1;
+end;
+$$
+language plpgsql stable;
+
+select * from plpgsql_check_function_tb('fx_flow(integer)');
+
+drop function fx_flow();
+
+drop function fx(int);
+
+create or replace function fx(x int)
+returns table(y int)
+as $$
+begin
+  return query select x union select x;
+end
+$$ language plpgsql;
+
+select * from fx(10);
+
+select * from plpgsql_check_function_tb('fx(int)');
+
+drop function fx(int);
+
+create or replace function fx(x int)
+returns table(y int, z int)
+as $$
+begin
+  return query select x,x+1 union select x, x+1;
+end
+$$ language plpgsql;
+
+select * from fx(10);
+
+select * from plpgsql_check_function_tb('fx(int)');
+
+drop function fx(int);
+
+create table xx(a int);
+
+create or replace function fx(x int)
+returns int as $$
+declare _a int;
+begin
+  begin
+    select a from xx into strict _a where a = x;
+    return _a;
+  exception when others then
+    null;
+  end;
+  return -1;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function_tb('fx(int)');
+
+drop table xx;
+
+create or replace function fx(x int)
+returns int as $$
+begin
+  begin
+    if (x > 0) then
+      raise exception 'xxx' using errcode = 'XX888';
+    else
+      raise exception 'yyy' using errcode = 'YY888';
+    end if;
+    return -1; -- dead code;
+  end;
+  return -1;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function_tb('fx(int)');
+
+create or replace function fx(x int)
+returns int as $$
+begin
+  begin
+    if (x > 0) then
+      raise exception 'xxx' using errcode = 'XX888';
+    else
+      raise exception 'yyy' using errcode = 'YY888';
+    end if;
+  exception
+    when sqlstate 'XX888' then
+      null;
+    when sqlstate 'YY888' then
+      null;
+  end;
+end; -- missing return;
+$$ language plpgsql;
+
+select * from plpgsql_check_function_tb('fx(int)');
+
+create or replace function fx(x int)
+returns int as $$
+begin
+  begin
+    if (x > 0) then
+      raise exception 'xxx' using errcode = 'XX888';
+    else
+      raise exception 'yyy' using errcode = 'YY888';
+    end if;
+  exception
+    when others then
+      return 10;
+  end;
+end; -- ok now
+$$ language plpgsql;
+
+select * from plpgsql_check_function_tb('fx(int)');
+
+--false alarm reported by Filip Zach
+create type testtype as (id integer);
+
+create or replace function fx()
+returns testtype as $$
+begin
+  return row(1);
+end;
+$$ language plpgsql;
+
+select * from fx();
+select fx();
+
+select * from plpgsql_check_function('fx()');
+
+drop function fx();
+
+create function out1(OUT f1 int, OUT f2 int)
+returns setof record as
+$$
+begin
+  for f1, f2 in
+     execute $q$ select 1, 2 $q$
+  loop
+    return next;
+  end loop;
+end $$ language plpgsql;
+
+select * from plpgsql_check_function('out1()');
+
+drop function out1();
+
+create function out1(OUT f1 int, OUT f2 int)
+returns setof record as
+$$
+begin
+  for f1, f2 in
+     select 1, 2
+  loop
+    return next;
+  end loop;
+end $$ language plpgsql;
+
+select * from plpgsql_check_function('out1()');
+
+drop function out1();
+
+-- never read variable detection
+create function a()
+returns int as $$
+declare foo int;
+begin
+  foo := 2;
+  return 1;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('a()');
+
+drop function a();
+
+-- issue #29 false unused variable
+create or replace function f1(in p_cursor refcursor) returns void as
+$body$
+declare
+  z_offset integer;
+begin
+  z_offset := 10;
+  move absolute z_offset from p_cursor;
+end;
+$body$ language 'plpgsql' stable;
+
+select * from plpgsql_check_function_tb('f1(refcursor)');
+
+drop function f1(refcursor);
+
+-- issue #30 segfault due NULL refname
+create or replace function test(a varchar)
+returns void as $$
+  declare x cursor (_a varchar) for select _a;
+begin
+  open x(a);
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function_tb('test(varchar)');
+
+drop function test(varchar);
+
+create or replace function test()
+returns void as $$
+declare x numeric;
+begin
+  x := NULL;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('test()');
+
+drop function test();
+
+create table testtable(a int);
+
+create or replace function test()
+returns int as $$
+declare r testtable;
+begin
+  select * into r from testtable;
+  return r.a;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('test()');
+
+set check_function_bodies to on;
+
+drop table testtable;
+
+create table testtable(a int, b int);
+
+create or replace function test()
+returns int as $$
+declare r testtable;
+begin
+  select * into r from testtable;
+  return r.a;
+end;
+$$ language plpgsql;
+
+alter table testtable drop column b;
+
+-- expected false alarm on PostgreSQL 10 and older
+-- there is not possibility to enforce recompilation
+-- before checking. 
+select * from plpgsql_check_function('test()');
+
+drop function test();
+
+-- issue #32
+create table bigtable(id bigint, v varchar);
+
+create or replace function test()
+returns void as $$
+declare
+  r record;
+  _id numeric;
+begin
+  select * into r from bigtable where id = _id;
+  for r in select * from bigtable where _id = id
+  loop
+  end loop;
+  if (exists(select * from bigtable where id = _id)) then
+  end if;
+end;
+$$ language plpgsql;
+
+select test();
+
+-- should to show performance warnings
+select * from plpgsql_check_function('test()', performance_warnings := true);
+
+create or replace function test()
+returns void as $$
+declare
+  r record;
+  _id bigint;
+begin
+  select * into r from bigtable where id = _id;
+  for r in select * from bigtable where _id = id
+  loop
+  end loop;
+  if (exists(select * from bigtable where id = _id)) then
+  end if;
+end;
+$$ language plpgsql;
+
+-- there are not any performance issue now
+select * from plpgsql_check_function('test()', performance_warnings := true);
+
+-- nextval, currval and setval test
+create table test_table();
+
+create or replace function testseq()
+returns void as $$
+begin
+  perform nextval('test_table');
+  perform currval('test_table');
+  perform setval('test_table', 10);
+  perform setval('test_table', 10, true);
+end;
+$$ language plpgsql;
+
+-- should to fail
+select testseq();
+
+select * from plpgsql_check_function('testseq()');
+
+drop function testseq();
+drop table test_table;
+
+-- tests designed for PostgreSQL 9.2
+
+set check_function_bodies to off;
+create table t1(a int, b int);
+
+create function f1()
+returns void as $$
+begin
+  if false then
+    update t1 set c = 30;
+  end if;
+  if false then
+    raise notice '% %', r.c;
+  end if;
+end;
+$$ language plpgsql;
+
+select f1();
+select * from plpgsql_check_function_tb('f1()', fatal_errors := true);
+select * from plpgsql_check_function_tb('f1()', fatal_errors := false);
+
+select * from plpgsql_check_function_tb('f1()');
+
+select f1();
+
+drop function f1();
+
+create or replace function f1()
+returns void as $$
+begin
+  if false then
+    raise notice '%', 1, 2;
+  end if;
+end;
+$$ language plpgsql;
+
+select f1();
+
+select * from plpgsql_check_function_tb('f1()');
+
+select f1();
+
+drop function f1();
+
+create or replace function f1()
+returns void as $$
+begin
+  if false then
+    raise notice '% %';
+  end if;
+end;
+$$ language plpgsql;
+
+select f1();
+
+select * from plpgsql_check_function_tb('f1()');
+
+select f1();
+
+drop function f1();
+
+create or replace function ml_trg()
+returns trigger as $$
+#option dump
+declare
+begin
+  if TG_OP = 'INSERT' then
+    if NEW.status_from IS NULL then
+      begin
+        -- performance issue only
+        select status into NEW.status_from
+           from pa
+          where pa_id = NEW.pa_id;
+        -- nonexist target value
+        select status into NEW.status_from_xxx
+           from pa
+          where pa_id = NEW.pa_id;
+      exception
+        when DATA_EXCEPTION then
+          new.status_from := 'DE';
+      end;
+    end if;
+  end if;
+  if TG_OP = 'DELETE' then return OLD; else return NEW; end if;
+exception
+  when OTHERS then
+    NULL;
+    if TG_OP = 'DELETE' then return OLD; else return NEW; end if;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('ml_trg()', 'ml', performance_warnings := true);
+
+create or replace function fx2()
+returns void as $$
+declare _pa pa;
+begin
+  select pa.id into _pa.id from pa limit 1;
+  select pa.pa_id into _pa.pa_id from pa limit 1;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx2()', performance_warnings := true);
+
+drop function fx2();
+
+create or replace function fx2()
+returns void as $$
+declare _pa pa;
+begin
+  _pa.id := (select pa.id from pa limit 1);
+  _pa.pa_id := (select pa.pa_id from pa limit 1);
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx2()', performance_warnings := true);
+
+drop function fx2();
+
+create or replace function test_lab()
+returns void as $$
+begin
+    <<outer>>
+    for a in 1..3 loop
+    <<sub>>
+    BEGIN
+        <<inner>>
+        for b in 8..9 loop
+            if a=2 then
+                continue sub;
+            end if;
+            raise notice '% %', a, b;
+        end loop inner;
+    END sub;
+    end loop outer;
+end;
+$$ language plpgsql;
+
+select test_lab();
+select * from plpgsql_check_function('test_lab()', performance_warnings := true);
+
+create or replace function test_lab()
+returns void as $$
+begin
+  continue;
+end;
+$$ language plpgsql;
+
+select test_lab();
+select * from plpgsql_check_function('test_lab()', performance_warnings := true);
+
+create type _exception_type as (
+  state text,
+  message text,
+  detail text);
+
+create or replace function f1()
+returns void as $$
+declare
+  _exception record;
+begin
+  _exception := NULL::_exception_type;
+exception when others then
+  get stacked diagnostics
+        _exception.state = RETURNED_SQLSTATE,
+        _exception.message = MESSAGE_TEXT,
+        _exception.detail = PG_EXCEPTION_DETAIL,
+        _exception.hint = PG_EXCEPTION_HINT;
+end;
+$$ language plpgsql;
+
+select f1();
+
+select * from plpgsql_check_function('f1()');
+
+drop function f1();
+drop type _exception_type;
+
+drop table t1;
+
+create function myfunc1(a int, b float) returns integer as $$ begin end $$ language plpgsql;
+create function myfunc2(a int, b float) returns integer as $$ begin end $$ language plpgsql;
+create function myfunc3(a int, b float) returns integer as $$ begin end $$ language plpgsql;
+create function myfunc4(a int, b float) returns integer as $$ begin end $$ language plpgsql;
+
+create table mytable(a int);
+create table myview as select * from mytable;
+
+create function testfunc(a int, b float)
+returns void as $$
+declare x integer;
+begin
+  raise notice '%', myfunc1(a, b);
+  x := myfunc2(a, b);
+  perform myfunc3(m.a, b) from myview m;
+  insert into mytable select myfunc4(a, b);
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('testfunc(int,float)');
+select type, schema, name, params from plpgsql_show_dependency_tb('testfunc(int,float)');
+
+drop function testfunc(int, float);
+drop function myfunc1(int, float);
+drop function myfunc2(int, float);
+drop function myfunc3(int, float);
+drop function myfunc4(int, float);
+
+drop table mytable;
+drop view myview;
+
+-- issue #34
+create or replace function testcase()
+returns bool as $$
+declare x int;
+begin
+  set local search_path to public, test;
+  case x when 1 then return true; else return false; end case;
+end;
+$$ language plpgsql;
+
+-- should not to raise warning
+select * from plpgsql_check_function('testcase()');
+
+drop function testcase();
+
+-- Adam's Bartoszewicz example
+create or replace function public.test12()
+returns refcursor
+language plpgsql
+as $body$
+declare
+  rc refcursor;
+begin
+  open rc scroll for select pc.* from pg_cast pc;
+  return rc;
+end;
+$body$;
+
+-- should not returns false alarm
+select * from plpgsql_check_function('test12()');
+
+drop function public.test12();

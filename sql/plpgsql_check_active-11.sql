@@ -1,73 +1,12 @@
 LOAD 'plpgsql';
 CREATE EXTENSION  IF NOT EXISTS plpgsql_check;
 
-create table t1(a int, b int);
-
-create function f1()
-returns void as $$
-begin
-  if false then
-    update t1 set c = 30;
-  end if;
-  if false then
-    raise notice '% %', r.c;
-  end if;
-end;
-$$ language plpgsql;
-
-select f1();
-select * from plpgsql_check_function_tb('f1()', fatal_errors := true);
-select * from plpgsql_check_function_tb('f1()', fatal_errors := false);
-
-select * from plpgsql_check_function_tb('f1()');
-
-select f1();
-
-drop function f1();
-
-
-
-create or replace function f1()
-returns void as $$
-begin
-  if false then
-    raise notice '%', 1, 2;
-  end if;
-end;
-$$ language plpgsql;
-
-select f1();
-
-select * from plpgsql_check_function_tb('f1()');
-
-select f1();
-
-drop function f1();
-
-create or replace function f1()
-returns void as $$
-begin
-  if false then
-    raise notice '% %';
-  end if;
-end;
-$$ language plpgsql;
-
-select f1();
-
-select * from plpgsql_check_function_tb('f1()');
-
-select f1();
-
-drop function f1();
-
 -- check event trigger function 
 create or replace function f1() returns event_trigger as $$
 BEGIN
     RAISE NOTICE 'test_event_trigger: % %', tg_event, tg_tag;
 END
 $$ language plpgsql;
-
 
 select * from plpgsql_check_function_tb('f1()');
 
@@ -113,7 +52,7 @@ begin
 end;
 $$ language plpgsql;
 
-select * from plpgsql_check_function('f1()', performance_warnings := true);
+select * from plpgsql_check_function('f1()', performance_warnings => true);
 
 create or replace function f1()
 returns setof t1tab as $$
@@ -123,7 +62,7 @@ begin
 end;
 $$ language plpgsql;
 
-select * from plpgsql_check_function('f1()', performance_warnings := true);
+select * from plpgsql_check_function('f1()', performance_warnings => true);
 
 create or replace function f1()
 returns setof t1tab as $$
@@ -134,7 +73,7 @@ begin
 end;
 $$ language plpgsql;
 
-select * from plpgsql_check_function('f1()', performance_warnings := true);
+select * from plpgsql_check_function('f1()', performance_warnings => true);
 
 create or replace function f1()
 returns setof t1tab as $$
@@ -145,10 +84,11 @@ begin
 end;
 $$ language plpgsql;
 
-select * from plpgsql_check_function('f1()', performance_warnings := true);
+select * from plpgsql_check_function('f1()', performance_warnings => true);
 
 drop function f1();
-drop table t1tab;
+
+create table t1(a int, b int);
 
 create or replace function fx()
 returns t2 as $$
@@ -157,9 +97,22 @@ begin
 end;
 $$ language plpgsql;
 
-select * from plpgsql_check_function('fx()', performance_warnings := true);
+select * from plpgsql_check_function('fx()', performance_warnings => true);
 
+drop function fx();
+
+drop table t1tab;
 drop table t1;
+
+create or replace function fx()
+returns void as $$
+begin
+  assert exists(select * from foo);
+  assert false, (select boo from boo limit 1);
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('fx()', fatal_errors => false);
 
 create or replace function ml_trg()
 returns trigger as $$
@@ -219,37 +172,51 @@ select * from plpgsql_check_function('fx2()', performance_warnings := true);
 
 drop function fx2();
 
-create or replace function test_lab()
+create type _exception_type as (
+  state text,
+  message text,
+  detail text);
+
+create or replace function f1()
 returns void as $$
+declare
+  _exception record;
 begin
-    <<outer>>
-    for a in 1..3 loop
-    <<sub>>
-    BEGIN
-        <<inner>>
-        for b in 8..9 loop
-            if a=2 then
-                continue sub;
-            end if;
-            raise notice '% %', a, b;
-        end loop inner;
-    END sub;
-    end loop outer;
+  _exception := NULL::_exception_type;
+exception when others then
+  get stacked diagnostics
+        _exception.state = RETURNED_SQLSTATE,
+        _exception.message = MESSAGE_TEXT,
+        _exception.detail = PG_EXCEPTION_DETAIL,
+        _exception.hint = PG_EXCEPTION_HINT;
 end;
 $$ language plpgsql;
 
-select test_lab();
-select * from plpgsql_check_function('test_lab()', performance_warnings := true);
+select f1();
 
-create or replace function test_lab()
+select * from plpgsql_check_function_tb('f1()');
+
+create or replace function f1()
 returns void as $$
+declare
+  _exception _exception_type;
 begin
-  continue;
+  _exception := NULL::_exception_type;
+exception when others then
+  get stacked diagnostics
+        _exception.state = RETURNED_SQLSTATE,
+        _exception.message = MESSAGE_TEXT,
+        _exception.detail = PG_EXCEPTION_DETAIL;
 end;
 $$ language plpgsql;
 
-select test_lab();
-select * from plpgsql_check_function('test_lab()', performance_warnings := true);
+select f1();
+
+select * from plpgsql_check_function_tb('f1()');
+
+drop function f1();
+
+drop type _exception_type;
 
 create type _exception_type as (
   state text,
@@ -277,3 +244,91 @@ select * from plpgsql_check_function('f1()');
 
 drop function f1();
 drop type _exception_type;
+
+create or replace procedure proc(a int)
+as $$
+begin
+end;
+$$ language plpgsql;
+
+call proc(10);
+
+select * from plpgsql_check_function('proc(int)');
+
+create or replace procedure testproc()
+as $$
+begin
+  call proc(10);
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+-- should to fail
+create or replace procedure testproc()
+as $$
+begin
+  call proc((select count(*) from pg_class));
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+drop procedure proc(int);
+
+create procedure proc(in a int, inout b int, in c int)
+as $$
+begin
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('proc(int,int, int)');
+
+create or replace procedure proc(in a int, inout b int, in c int)
+as $$
+begin
+  b := a + c;
+end;
+$$ language plpgsql;
+
+select * from plpgsql_check_function('proc(int,int, int)');
+
+create or replace procedure testproc()
+as $$
+declare r int;
+begin
+  call proc(10, r, 20);
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+-- should to fail
+create or replace procedure testproc()
+as $$
+declare r int;
+begin
+  call proc(10, r + 10, 20);
+end;
+$$ language plpgsql;
+
+call testproc();
+
+select * from plpgsql_check_function('testproc()');
+
+create or replace procedure testproc(inout r int)
+as $$
+begin
+  call proc(10, r, 20);
+end;
+$$ language plpgsql;
+
+call testproc(10);
+
+select * from plpgsql_check_function('testproc(int)');

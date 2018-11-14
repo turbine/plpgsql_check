@@ -4,7 +4,7 @@
  *
  *			  enhanced checks for plpgsql functions
  *
- * by Pavel Stehule 2013-2016
+ * by Pavel Stehule 2013-2018
  *
  *-------------------------------------------------------------------------
  *
@@ -41,36 +41,33 @@
 
 #endif
 
+#if PG_VERSION_NUM >= 110000
 
-#if PG_VERSION_NUM >= 90300
+#include "utils/expandedrecord.h"
+
+#endif
+
+#if PG_VERSION_NUM >= 100000
+
+#include "utils/regproc.h"
+
+#endif
+
 #include "access/htup_details.h"
-
-#else
-
-/* Older version doesn't support event triggers */
-
-#ifdef _MSC_VER
-typedef struct {char nothing[0];}  EventTriggerData;
-#else
-typedef struct {}  EventTriggerData;
-#endif
-
-typedef enum PLpgSQL_trigtype
-{
-	PLPGSQL_DML_TRIGGER,
-	PLPGSQL_EVENT_TRIGGER,
-	PLPGSQL_NOT_TRIGGER
-} PLpgSQL_trigtype;
-
-#endif
-
 #include "access/tupconvert.h"
 #include "access/tupdesc.h"
+
+#ifndef TupleDescAttr
+#define TupleDescAttr(tupdesc, i) ((tupdesc)->attrs[(i)])
+#endif
+
 #include "catalog/pg_language.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/spi_priv.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
 #include "parser/parse_coerce.h"
 #include "tcop/utility.h"
 #include "tsearch/ts_locale.h"
@@ -82,6 +79,7 @@ typedef enum PLpgSQL_trigtype
 #include "utils/typcache.h"
 #include "utils/rel.h"
 #include "utils/json.h"
+#include "utils/reltrigger.h"
 #include "utils/xml.h"
 
 #ifdef PG_MODULE_MAGIC
@@ -106,6 +104,19 @@ PG_MODULE_MAGIC;
 #define Anum_result_query			9
 #define Anum_result_context			10
 
+/*
+ * columns of plpgsql_show_dependency_tb result 
+ *
+ */
+#define Natts_dependency				5
+
+#define Anum_dependency_type			0
+#define Anum_dependency_oid				1
+#define Anum_dependency_schema			2
+#define Anum_dependency_name			3
+#define Anum_dependency_params			4
+
+
 enum
 {
 	PLPGSQL_CHECK_ERROR,
@@ -120,15 +131,25 @@ enum
 	PLPGSQL_CHECK_FORMAT_TEXT,
 	PLPGSQL_CHECK_FORMAT_TABULAR,
 	PLPGSQL_CHECK_FORMAT_XML,
-	PLPGSQL_CHECK_FORMAT_JSON
+	PLPGSQL_CHECK_FORMAT_JSON,
+	PLPGSQL_SHOW_DEPENDENCY_FORMAT_TABULAR
+};
+
+enum
+{
+	PLPGSQL_CHECK_CLOSED,
+	PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS,
+	PLPGSQL_CHECK_POSSIBLY_CLOSED,
+	PLPGSQL_CHECK_UNCLOSED,
+	PLPGSQL_CHECK_UNKNOWN
 };
 
 enum
 {
 	PLPGSQL_CHECK_MODE_DISABLED,		/* all functionality is disabled */
-	PLPGSQL_CHECK_MODE_BY_FUNCTION,	/* checking is allowed via CHECK function only (default) */
-	PLPGSQL_CHECK_MODE_FRESH_START,	/* check only when function is called first time */
-	PLPGSQL_CHECK_MODE_EVERY_START	/* check on every start */
+	PLPGSQL_CHECK_MODE_BY_FUNCTION,		/* checking is allowed via CHECK function only (default) */
+	PLPGSQL_CHECK_MODE_FRESH_START,		/* check only when function is called first time */
+	PLPGSQL_CHECK_MODE_EVERY_START		/* check on every start */
 };
 
 typedef struct PLpgSQL_stmt_stack_item
@@ -155,7 +176,12 @@ typedef struct PLpgSQL_checkstate
 	List	   *exprs;						/* list of all expression created by checker */
 	bool		is_active_mode;				/* true, when checking is started by plpgsql_check_function */
 	Bitmapset  *used_variables;				/* track which variables have been used; bit per varno */
+	Bitmapset  *modif_variables;			/* track which variables had been changed; bit per varno */
 	PLpgSQL_stmt_stack_item *top_stmt_stack;	/* list of known labels + related command */
+	bool		found_return_query;			/* true, when code contains RETURN query */
+	bool		is_procedure;				/* true, when checked code is a procedure */
+	Bitmapset	   *func_oids;				/* list of used (and displayed) functions */
+	Bitmapset	   *rel_oids;				/* list of used (and displayed) relations */
 } PLpgSQL_checkstate;
 
 static void assign_tupdesc_dno(PLpgSQL_checkstate *cstate, int varno, TupleDesc tupdesc, bool isnull);
@@ -178,6 +204,8 @@ static void check_expr_as_rvalue(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr,
 				   int targetdno, bool use_element_type, bool is_expression);
 static void check_returned_expr(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr, bool is_expression);
 static void check_expr_as_sqlstmt_nodata(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr);
+static void check_expr_as_sqlstmt_data(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr);
+static bool check_expr_as_sqlstmt(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr);
 static void check_assign_to_target_type(PLpgSQL_checkstate *cstate,
 							 Oid target_typoid, int32 target_typmod,
 							 Oid value_typoid,
@@ -194,10 +222,26 @@ static void check_plpgsql_function(HeapTuple procTuple, Oid relid, PLpgSQL_trigt
 									  bool performance_warnings,
 									  bool extra_warnings);
 static void check_row_or_rec(PLpgSQL_checkstate *cstate, PLpgSQL_row *row, PLpgSQL_rec *rec);
-static void check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt);
-static void check_stmts(PLpgSQL_checkstate *cstate, List *stmts);
+
+#if PG_VERSION_NUM >= 110000
+
+static void check_variable(PLpgSQL_checkstate *cstate, PLpgSQL_variable *var);
+static void check_assignment_to_variable(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr,
+				 PLpgSQL_variable *var, int targetdno);
+
+#define get_eval_mcontext(estate) \
+	((estate)->eval_econtext->ecxt_per_tuple_memory)
+#define eval_mcontext_alloc(estate, sz) \
+	MemoryContextAlloc(get_eval_mcontext(estate), sz)
+#define eval_mcontext_alloc0(estate, sz) \
+	MemoryContextAllocZero(get_eval_mcontext(estate), sz)
+
+#endif
+
+static void check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt, int *closing, List **exceptions);
+static void check_stmts(PLpgSQL_checkstate *cstate, List *stmts, int *closing, List **exceptions);
 static void check_target(PLpgSQL_checkstate *cstate, int varno, Oid *expected_typoid, int *expected_typmod);
-static PLpgSQL_datum *copy_plpgsql_datum(PLpgSQL_datum *datum);
+static PLpgSQL_datum *copy_plpgsql_datum(PLpgSQL_checkstate *cstate, PLpgSQL_datum *datum);
 static char *datum_get_refname(PLpgSQL_datum *d);
 static TupleDesc expr_get_desc(PLpgSQL_checkstate *cstate,
 							  PLpgSQL_expr *query,
@@ -228,6 +272,8 @@ static int load_configuration(HeapTuple procTuple, bool *reload_config);
 static void mark_as_checked(PLpgSQL_function *func);
 static void plpgsql_check_HashTableInit(void);
 static void prohibit_write_plan(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query);
+static void check_fishy_qual(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query);
+static void check_seq_functions(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query);
 static void put_error(PLpgSQL_checkstate *cstate,
 					  int sqlerrcode, int lineno,
 					  const char *message, const char *detail, const char *hint,
@@ -251,7 +297,8 @@ static void setup_fake_fcinfo(HeapTuple procTuple,
 										 Oid relid,
 										 EventTriggerData *etrigdata,
 										 Oid funcoid,
-										 PLpgSQL_trigtype trigtype);
+										 PLpgSQL_trigtype trigtype,
+										 Trigger *tg_trigger);
 static void setup_plpgsql_estate(PLpgSQL_execstate *estate,
 								 PLpgSQL_function *func, ReturnSetInfo *rsi);
 static void trigger_check(PLpgSQL_function *func,
@@ -272,9 +319,27 @@ static void tuplestore_put_error_tabular(Tuplestorestate *tuple_store, TupleDesc
 static void tuplestore_put_text_line(Tuplestorestate *tuple_store, TupleDesc tupdesc,
 								    const char *message, int len);
 static void report_unused_variables(PLpgSQL_checkstate *cstate);
-static void record_variable_usage(PLpgSQL_checkstate *cstate, int dno);
-static bool is_const_null_expr(PLpgSQL_expr *query);
+static void record_variable_usage(PLpgSQL_checkstate *cstate, int dno, bool write);
+static bool datum_is_used(PLpgSQL_checkstate *cstate, int dno, bool write);
+static bool is_const_null_expr(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query);
 static void prohibit_transaction_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query);
+static int merge_closing(int c, int c_local, List **exceptions, List *exceptions_local, int err_code);
+static int possibly_closed(int c);
+static Query *ExprGetQuery(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query);
+static char *ExprGetString(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query, bool *IsConst);
+static bool exception_matches_conditions(int err_code, PLpgSQL_condition *cond);
+static bool is_internal_variable(PLpgSQL_variable *var);
+static void detect_dependency(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr);
+static void tuplestore_put_dependency(Tuplestorestate *tuple_store,
+									  TupleDesc tupdesc, char *type, Oid oid,
+									  char *schema, char *name, char *params);
+
+#if PG_VERSION_NUM >= 110000
+
+static bool compatible_tupdescs(TupleDesc src_tupdesc, TupleDesc dst_tupdesc);
+static PLpgSQL_row *CallExprGetRowTarget(PLpgSQL_checkstate *cstate, PLpgSQL_expr *CallExpr);
+
+#endif
 
 static bool plpgsql_check_other_warnings = false;
 static bool plpgsql_check_extra_warnings = false;
@@ -291,6 +356,22 @@ static const struct config_enum_entry plpgsql_check_mode_options[] = {
 	{"every_start", PLPGSQL_CHECK_MODE_EVERY_START, false},
 	{NULL, 0, false}
 };
+
+#if PG_VERSION_NUM >= 110000
+
+#define recvar_tuple(rec)		(rec->erh ? expanded_record_get_tuple(rec->erh) : NULL)
+#define recvar_tupdesc(rec)		(rec->erh ? expanded_record_fetch_tupdesc(rec->erh) : NULL)
+
+#define is_procedure(estate)		((estate)->func && (estate)->func->fn_rettype == InvalidOid)
+
+#else
+
+#define recvar_tuple(rec)		(rec->tup)
+#define recvar_tupdesc(rec)		(rec->tupdesc)
+
+#define is_procedure(estate)	(false)
+
+#endif
 
 /* ----------
  * Hash table for checked functions
@@ -310,6 +391,7 @@ typedef struct plpgsql_hashent
 
 PG_FUNCTION_INFO_V1(plpgsql_check_function);
 PG_FUNCTION_INFO_V1(plpgsql_check_function_tb);
+PG_FUNCTION_INFO_V1(plpgsql_show_dependency_tb);
 
 /*
  * Module initialization
@@ -377,6 +459,254 @@ _PG_init(void)
 }
 
 /*
+ * recval_init, recval_release, recval_assign_tupdesc
+ *
+ *   a set of functions designed to better portability between PostgreSQL 11
+ *   with expanded records support and older PostgreSQL versions.
+ */
+static void
+recval_init(PLpgSQL_rec *rec)
+{
+	Assert(rec->dtype == PLPGSQL_DTYPE_REC);
+
+#if PG_VERSION_NUM >= 110000
+
+	rec->erh = NULL;
+
+#else
+
+	rec->tup = NULL;
+	rec->freetup = false;
+	rec->freetupdesc = false;
+
+#endif
+}
+
+static void
+recval_release(PLpgSQL_rec *rec)
+{
+
+#if PG_VERSION_NUM >= 110000
+
+	Assert(rec->dtype == PLPGSQL_DTYPE_REC);
+
+	if (rec->erh)
+		DeleteExpandedObject(ExpandedRecordGetDatum(rec->erh));
+	rec->erh = NULL;
+
+#else
+
+	if (rec->freetup)
+		heap_freetuple(rec->tup);
+
+	if (rec->freetupdesc)
+		FreeTupleDesc(rec->tupdesc);
+
+	rec->freetup = false;
+	rec->freetupdesc = false;
+
+#endif
+
+}
+
+/*
+ * is_null is true, when we assign NULL expression and type should not be checked.
+ */
+static void
+recval_assign_tupdesc(PLpgSQL_checkstate *cstate, PLpgSQL_rec *rec, TupleDesc tupdesc, bool is_null)
+{
+
+#if PG_VERSION_NUM >= 110000
+
+	PLpgSQL_execstate	   *estate = cstate->estate;
+	ExpandedRecordHeader   *newerh;
+	MemoryContext			mcontext;
+	TupleDesc	var_tupdesc;
+	Datum	   *newvalues;
+	bool	   *newnulls;
+	char	   *chunk;
+	int			vtd_natts;
+	int			i;
+
+	mcontext = get_eval_mcontext(estate);
+	recval_release(rec);
+
+	/*
+	 * code is reduced version of make_expanded_record_for_rec
+	 */
+	if (rec->rectypeid != RECORDOID)
+	{
+		newerh = make_expanded_record_from_typeid(rec->rectypeid, -1,
+													  mcontext);
+	}
+	else
+	{
+		if (!tupdesc)
+			return;
+
+		newerh = make_expanded_record_from_tupdesc(tupdesc,
+													   mcontext);
+	}
+
+	/*
+	 * code is reduced version of exec_move_row_from_field
+	 */
+	var_tupdesc = expanded_record_get_tupdesc(newerh);
+	vtd_natts = var_tupdesc->natts;
+
+	if (!is_null && tupdesc != NULL && !compatible_tupdescs(var_tupdesc, tupdesc))
+	{
+		int		i = 0;
+		int		j = 0;
+		int		target_nfields = 0;
+		int		src_nfields = 0;
+		bool	src_field_is_valid = false;
+		bool	target_field_is_valid = false;
+		Form_pg_attribute sattr = NULL;
+		Form_pg_attribute tattr = NULL;
+
+		while (i < var_tupdesc->natts || j < tupdesc->natts)
+		{
+			if (!target_field_is_valid && i < var_tupdesc->natts)
+			{
+				tattr = TupleDescAttr(var_tupdesc, i);
+				if (tattr->attisdropped)
+				{
+					i += 1;
+					continue;
+				}
+				target_field_is_valid = true;
+				target_nfields += 1;
+			}
+
+			if (!src_field_is_valid && j < tupdesc->natts)
+			{
+				sattr = TupleDescAttr(tupdesc, j);
+				if (sattr->attisdropped)
+				{
+					j += 1;
+					continue;
+				}
+				src_field_is_valid = true;
+				src_nfields += 1;
+			}
+
+			if (src_field_is_valid && target_field_is_valid)
+			{
+				check_assign_to_target_type(cstate,
+												tattr->atttypid, tattr->atttypmod,
+												sattr->atttypid,
+												false);
+
+				/* try to search next tuple of fields */
+				src_field_is_valid =  false;
+				target_field_is_valid = false;
+				i += 1;
+				j += 1;
+			}
+			else
+				break;
+		}
+
+		if (src_nfields < target_nfields)
+			put_error(cstate,
+						  0, 0,
+						  "too few attributes for composite variable",
+						  NULL,
+						  NULL,
+						  PLPGSQL_CHECK_WARNING_OTHERS,
+						  0, NULL, NULL);
+		else if (src_nfields > target_nfields)
+			put_error(cstate,
+						  0, 0,
+						  "too many attributes for composite variable",
+						  NULL,
+						  NULL,
+						  PLPGSQL_CHECK_WARNING_OTHERS,
+						  0, NULL, NULL);
+	}
+
+	chunk = eval_mcontext_alloc(estate,
+								vtd_natts * (sizeof(Datum) + sizeof(bool)));
+	newvalues = (Datum *) chunk;
+	newnulls = (bool *) (chunk + vtd_natts * sizeof(Datum));
+
+	for (i = 0; i < vtd_natts; i++)
+	{
+		newvalues[i] = (Datum) 0;
+		newnulls[i] = true;
+	}
+
+	expanded_record_set_fields(newerh, newvalues, newnulls, true);
+
+	TransferExpandedRecord(newerh, estate->datum_context);
+	rec->erh = newerh;
+
+#else
+
+	bool	   *nulls;
+	HeapTuple	tup;
+
+	recval_release(rec);
+
+	if (!tupdesc)
+		return;
+
+	/* initialize rec by NULLs */
+	nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
+	memset(nulls, true, tupdesc->natts * sizeof(bool));
+
+	rec->tupdesc = CreateTupleDescCopy(tupdesc);
+	rec->freetupdesc = true;
+
+	tup = heap_form_tuple(tupdesc, NULL, nulls);
+	if (HeapTupleIsValid(tup))
+	{
+		rec->tup = tup;
+		rec->freetup = true;
+	}
+	else
+		elog(ERROR, "cannot to build valid composite value");
+
+#endif
+
+}
+
+static int
+TupleDescNVatts(TupleDesc tupdesc)
+{
+	int		natts = 0;
+	int		i;
+
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		if (!TupleDescAttr(tupdesc, i)->attisdropped)
+			natts += 1;
+	}
+
+	return natts;
+}
+
+/*
+ * row->nfields can cound dropped columns. When this behave can raise
+ * false alarms, we should to count fields more precisely.
+ */
+static int
+RowGetValidFields(PLpgSQL_row *row)
+{
+	int		i;
+	int		result = 0;
+
+	for (i = 0; i < row->nfields; i++)
+	{
+		if (row->varnos[i] != -1)
+			result += 1;
+	}
+
+	return result;
+}
+
+/*
  * plpgsql_check_func_beg 
  *
  *      callback function - called by plgsql executor, when function is started
@@ -387,6 +717,8 @@ static void
 check_on_func_beg(PLpgSQL_execstate * estate, PLpgSQL_function * func)
 {
 	const char *err_text = estate->err_text;
+	int closing;
+	List		*exceptions;
 
 	if (plpgsql_check_mode == PLPGSQL_CHECK_MODE_FRESH_START ||
 		   plpgsql_check_mode == PLPGSQL_CHECK_MODE_EVERY_START)
@@ -424,6 +756,8 @@ check_on_func_beg(PLpgSQL_execstate * estate, PLpgSQL_function * func)
 		/* use real estate */
 		cstate.estate = estate;
 
+		cstate.is_procedure = func->fn_rettype == InvalidOid;
+
 		old_cxt = MemoryContextSwitchTo(cstate.check_cxt);
 
 		/*
@@ -439,6 +773,18 @@ check_on_func_beg(PLpgSQL_execstate * estate, PLpgSQL_function * func)
 			{
 				PLpgSQL_rec *rec = (PLpgSQL_rec *) estate->datums[i];
 
+#if PG_VERSION_NUM >= 110000
+
+				if (rec->erh)
+					expanded_record_set_tuple(saved_records[i].erh,
+											  expanded_record_get_tuple(rec->erh),
+											  true,
+											  true);
+				else
+					saved_records[i].erh = NULL;
+
+#else
+
 				saved_records[i].tup = rec->tup;
 				saved_records[i].tupdesc = rec->tupdesc;
 				saved_records[i].freetup = rec->freetup;
@@ -447,6 +793,9 @@ check_on_func_beg(PLpgSQL_execstate * estate, PLpgSQL_function * func)
 				/* don't release a original tupdesc and original tup */
 				rec->freetup = false;
 				rec->freetupdesc = false;
+
+#endif
+
 			}
 			else if (estate->datums[i]->dtype == PLPGSQL_DTYPE_VAR)
 			{
@@ -474,7 +823,21 @@ check_on_func_beg(PLpgSQL_execstate * estate, PLpgSQL_function * func)
 			/*
 			 * Now check the toplevel block of statements
 			 */
-			check_stmt(&cstate, (PLpgSQL_stmt *) func->action);
+			check_stmt(&cstate, (PLpgSQL_stmt *) func->action, &closing, &exceptions);
+
+			estate->err_stmt = NULL;
+
+			if (closing != PLPGSQL_CHECK_CLOSED && closing != PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS &&
+				!is_procedure(estate))
+				put_error(&cstate,
+								  ERRCODE_S_R_E_FUNCTION_EXECUTED_NO_RETURN_STATEMENT, 0,
+								  "control reached end of function without RETURN",
+								  NULL,
+								  NULL,
+								  closing == PLPGSQL_CHECK_UNCLOSED ?
+										PLPGSQL_CHECK_ERROR : PLPGSQL_CHECK_WARNING_EXTRA,
+								  0, NULL, NULL);
+
 			report_unused_variables(&cstate);
 		}
 		PG_CATCH();
@@ -504,6 +867,15 @@ check_on_func_beg(PLpgSQL_execstate * estate, PLpgSQL_function * func)
 			{
 				PLpgSQL_rec *rec = (PLpgSQL_rec *) estate->datums[i];
 
+#if PG_VERSION_NUM >= 110000
+
+				expanded_record_set_tuple(rec->erh,
+										  expanded_record_get_tuple(saved_records[i].erh),
+										  false,
+										  false);
+
+#else
+
 				if (rec->freetupdesc)
 					FreeTupleDesc(rec->tupdesc);
 
@@ -511,6 +883,9 @@ check_on_func_beg(PLpgSQL_execstate * estate, PLpgSQL_function * func)
 				rec->tupdesc = saved_records[i].tupdesc;
 				rec->freetup = saved_records[i].freetup;
 				rec->freetupdesc = saved_records[i].freetupdesc;
+
+#endif
+
 			}
 			else if (estate->datums[i]->dtype == PLPGSQL_DTYPE_VAR)
 			{
@@ -881,14 +1256,8 @@ get_trigtype(HeapTuple procTuple)
 		if (proc->prorettype == TRIGGEROID ||
 			(proc->prorettype == OPAQUEOID && proc->pronargs == 0))
 			return PLPGSQL_DML_TRIGGER;
-
-#if PG_VERSION_NUM >= 90300
-
 		else if (proc->prorettype == EVTTRIGGEROID)
 			return PLPGSQL_EVENT_TRIGGER;
-
-#endif
-
 		else if (proc->prorettype != RECORDOID &&
 				 proc->prorettype != VOIDOID &&
 				 !IsPolymorphicType(proc->prorettype))
@@ -973,6 +1342,7 @@ check_plpgsql_function(HeapTuple procTuple, Oid relid, PLpgSQL_trigtype trigtype
 	FmgrInfo	flinfo;
 	TriggerData trigdata;
 	EventTriggerData etrigdata;
+	Trigger tg_trigger;
 	int			rc;
 	ResourceOwner oldowner;
 	PLpgSQL_execstate *cur_estate = NULL;
@@ -989,7 +1359,7 @@ check_plpgsql_function(HeapTuple procTuple, Oid relid, PLpgSQL_trigtype trigtype
 		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
 
 	setup_fake_fcinfo(procTuple, &flinfo, &fake_fcinfo, &rsinfo, &trigdata, relid, &etrigdata,
-										  funcoid, trigtype);
+										  funcoid, trigtype, &tg_trigger);
 
 	setup_cstate(&cstate, funcoid, tupdesc, tupstore,
 							    fatal_errors,
@@ -1046,22 +1416,7 @@ check_plpgsql_function(HeapTuple procTuple, Oid relid, PLpgSQL_trigtype trigtype
 
 			/* recheck trigtype */
 
-#if PG_VERSION_NUM >= 90300
-
 			Assert(function->fn_is_trigger == trigtype);
-
-#else
-
-#ifdef USE_ASSERT_CHECKING
-
-			if (function->fn_is_trigger)
-				Assert(trigtype == PLPGSQL_DML_TRIGGER);
-			else
-				Assert(trigtype == PLPGSQL_NOT_TRIGGER);
-
-#endif
-
-#endif
 
 			setup_plpgsql_estate(&estate, function, (ReturnSetInfo *) fake_fcinfo.resultinfo);
 			cstate.estate = &estate;
@@ -1162,12 +1517,14 @@ function_check(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 			   PLpgSQL_execstate *estate, PLpgSQL_checkstate *cstate)
 {
 	int			i;
+	int closing = PLPGSQL_CHECK_UNCLOSED;
+	List	   *exceptions;
 
 	/*
 	 * Make local execution copies of all the datums
 	 */
 	for (i = 0; i < cstate->estate->ndatums; i++)
-		cstate->estate->datums[i] = copy_plpgsql_datum(func->datums[i]);
+		cstate->estate->datums[i] = copy_plpgsql_datum(cstate, func->datums[i]);
 
 	/*
 	 * Store the actual call argument values (fake) into the appropriate
@@ -1181,7 +1538,21 @@ function_check(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 	/*
 	 * Now check the toplevel block of statements
 	 */
-	check_stmt(cstate, (PLpgSQL_stmt *) func->action);
+	check_stmt(cstate, (PLpgSQL_stmt *) func->action, &closing, &exceptions);
+
+	/* clean state values - next errors are not related to any command */
+	cstate->estate->err_stmt = NULL;
+
+	if (closing != PLPGSQL_CHECK_CLOSED && closing != PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS &&
+		!is_procedure(cstate->estate))
+		put_error(cstate,
+						  ERRCODE_S_R_E_FUNCTION_EXECUTED_NO_RETURN_STATEMENT, 0,
+						  "control reached end of function without RETURN",
+						  NULL,
+						  NULL,
+						  closing == PLPGSQL_CHECK_UNCLOSED ? PLPGSQL_CHECK_ERROR : PLPGSQL_CHECK_WARNING_EXTRA,
+						  0, NULL, NULL);
+
 	report_unused_variables(cstate);
 }
 
@@ -1196,12 +1567,14 @@ trigger_check(PLpgSQL_function *func, Node *tdata,
 	PLpgSQL_rec *rec_new,
 			   *rec_old;
 	int			i;
+	int closing = PLPGSQL_CHECK_UNCLOSED;
+	List	   *exceptions;
 
 	/*
 	 * Make local execution copies of all the datums
 	 */
 	for (i = 0; i < cstate->estate->ndatums; i++)
-		cstate->estate->datums[i] = copy_plpgsql_datum(func->datums[i]);
+		cstate->estate->datums[i] = copy_plpgsql_datum(cstate, func->datums[i]);
 
 	if (IsA(tdata, TriggerData))
 	{
@@ -1217,6 +1590,26 @@ trigger_check(PLpgSQL_function *func, Node *tdata,
 		 * NEW.foo = 'xyz')", which should parse regardless of the current
 		 * trigger type.
 		 */
+#if PG_VERSION_NUM >= 110000
+
+		/*
+		 * find all PROMISE VARIABLES and initit their
+		 */
+		for (i = 0; i < func->ndatums; i++)
+		{
+			PLpgSQL_datum *datum = func->datums[i];
+
+			if (datum->dtype == PLPGSQL_DTYPE_PROMISE)
+				init_datum_dno(cstate, datum->dno);
+		}
+
+		rec_new = (PLpgSQL_rec *) (cstate->estate->datums[func->new_varno]);
+		recval_assign_tupdesc(cstate, rec_new, trigdata->tg_relation->rd_att, false);
+		rec_old = (PLpgSQL_rec *) (cstate->estate->datums[func->old_varno]);
+		recval_assign_tupdesc(cstate, rec_old, trigdata->tg_relation->rd_att, false);
+
+#else
+
 		rec_new = (PLpgSQL_rec *) (cstate->estate->datums[func->new_varno]);
 		rec_new->freetup = false;
 		rec_new->freetupdesc = false;
@@ -1240,25 +1633,42 @@ trigger_check(PLpgSQL_function *func, Node *tdata,
 		init_datum_dno(cstate, func->tg_table_schema_varno);
 		init_datum_dno(cstate, func->tg_nargs_varno);
 		init_datum_dno(cstate, func->tg_argv_varno);
-	}
-
-#if PG_VERSION_NUM >= 90300
-
-	else if (IsA(tdata, EventTriggerData))
-	{
-		init_datum_dno(cstate, func->tg_event_varno);
-		init_datum_dno(cstate, func->tg_tag_varno);
-	}
 
 #endif
 
+	}
+	else if (IsA(tdata, EventTriggerData))
+	{
+
+#if PG_VERSION_NUM < 110000
+
+		init_datum_dno(cstate, func->tg_event_varno);
+		init_datum_dno(cstate, func->tg_tag_varno);
+
+#endif
+
+	}
 	else
 		elog(ERROR, "unexpected environment");
 
 	/*
 	 * Now check the toplevel block of statements
 	 */
-	check_stmt(cstate, (PLpgSQL_stmt *) func->action);
+	check_stmt(cstate, (PLpgSQL_stmt *) func->action, &closing, &exceptions);
+
+	/* clean state values - next errors are not related to any command */
+	cstate->estate->err_stmt = NULL;
+
+	if (closing != PLPGSQL_CHECK_CLOSED && closing != PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS &&
+		!is_procedure(cstate->estate))
+		put_error(cstate,
+						  ERRCODE_S_R_E_FUNCTION_EXECUTED_NO_RETURN_STATEMENT, 0,
+						  "control reached end of function without RETURN",
+						  NULL,
+						  NULL,
+						  closing == PLPGSQL_CHECK_UNCLOSED ? PLPGSQL_CHECK_ERROR : PLPGSQL_CHECK_WARNING_EXTRA,
+						  0, NULL, NULL);
+
 	report_unused_variables(cstate);
 }
 
@@ -1330,7 +1740,7 @@ is_polymorphic_tupdesc(TupleDesc tupdesc)
 	int	i;
 
 	for (i = 0; i < tupdesc->natts; i++)
-		if (IsPolymorphicType(tupdesc->attrs[i]->atttypid))
+		if (IsPolymorphicType(TupleDescAttr(tupdesc, i)->atttypid))
 			return true;
 
 	return false;
@@ -1351,7 +1761,8 @@ setup_fake_fcinfo(HeapTuple procTuple,
 						  Oid relid,
 						  EventTriggerData *etrigdata,
 						  Oid funcoid,
-						  PLpgSQL_trigtype trigtype)
+						  PLpgSQL_trigtype trigtype,
+						  Trigger *tg_trigger)
 {
 	Form_pg_proc procform;
 	Oid		rettype;
@@ -1373,24 +1784,23 @@ setup_fake_fcinfo(HeapTuple procTuple,
 	{
 		Assert(trigdata != NULL);
 
-		MemSet(trigdata, 0, sizeof(trigdata));
+		MemSet(trigdata, 0, sizeof(TriggerData));
+		MemSet(tg_trigger, 0, sizeof(Trigger));
+
 		trigdata->type = T_TriggerData;
+		trigdata->tg_trigger = tg_trigger;
+
 		fcinfo->context = (Node *) trigdata;
 
 		if (OidIsValid(relid))
 			trigdata->tg_relation = relation_open(relid, AccessShareLock);
 	}
-
-#if PG_VERSION_NUM >= 90300
-
 	else if (trigtype == PLPGSQL_EVENT_TRIGGER)
 	{
 		MemSet(etrigdata, 0, sizeof(etrigdata));
 		etrigdata->type = T_EventTriggerData;
 		fcinfo->context = (Node *) etrigdata;
 	}
-
-#endif
 
 	/* 
 	 * prepare ReturnSetInfo
@@ -1473,18 +1883,34 @@ setup_cstate(PLpgSQL_checkstate *cstate,
 	cstate->argnames = NIL;
 	cstate->exprs = NIL;
 	cstate->used_variables = NULL;
+	cstate->modif_variables = NULL;
 	cstate->top_stmt_stack = NULL;
 
 	cstate->format = format;
 	cstate->is_active_mode = is_active_mode;
 
+	cstate->func_oids = NULL;
+	cstate->rel_oids = NULL;
+
 	cstate->sinfo = NULL;
+
+#if PG_VERSION_NUM >= 110000
+
+	cstate->check_cxt = AllocSetContextCreate(CurrentMemoryContext,
+										 "plpgsql_check temporary cxt",
+										   ALLOCSET_DEFAULT_SIZES);
+
+#else
 
 	cstate->check_cxt = AllocSetContextCreate(CurrentMemoryContext,
 										 "plpgsql_check temporary cxt",
 										   ALLOCSET_DEFAULT_MINSIZE,
 										   ALLOCSET_DEFAULT_INITSIZE,
 										   ALLOCSET_DEFAULT_MAXSIZE);
+
+#endif
+
+	cstate->found_return_query = false;
 }
 
 /* ----------
@@ -1511,7 +1937,21 @@ setup_plpgsql_estate(PLpgSQL_execstate *estate,
 
 	estate->readonly_func = func->fn_readonly;
 
+#if PG_VERSION_NUM < 110000
+
 	estate->rettupdesc = NULL;
+	estate->eval_econtext = NULL;
+
+#else
+
+	estate->eval_econtext = makeNode(ExprContext);
+	estate->eval_econtext->ecxt_per_tuple_memory = AllocSetContextCreate(CurrentMemoryContext,
+													"ExprContext",
+													ALLOCSET_DEFAULT_SIZES);
+	estate->datum_context = CurrentMemoryContext;
+
+#endif
+
 	estate->exitlabel = NULL;
 	estate->cur_error = NULL;
 
@@ -1521,8 +1961,17 @@ setup_plpgsql_estate(PLpgSQL_execstate *estate,
 		estate->tuple_store_cxt = rsi->econtext->ecxt_per_query_memory;
 		estate->tuple_store_owner = CurrentResourceOwner;
 
+#if PG_VERSION_NUM >= 110000
+
+		estate->tuple_store_desc = rsi->expectedDesc;
+
+#else
+
 		if (estate->retisset)
 			estate->rettupdesc = rsi->expectedDesc;
+
+#endif
+
 	}
 	else
 	{
@@ -1539,7 +1988,6 @@ setup_plpgsql_estate(PLpgSQL_execstate *estate,
 	estate->eval_tuptable = NULL;
 	estate->eval_processed = 0;
 	estate->eval_lastoid = InvalidOid;
-	estate->eval_econtext = NULL;
 
 #if PG_VERSION_NUM < 90500
 
@@ -1563,6 +2011,13 @@ init_datum_dno(PLpgSQL_checkstate *cstate, int dno)
 {
 	switch (cstate->estate->datums[dno]->dtype)
 	{
+
+#if PG_VERSION_NUM >= 110000
+
+		case PLPGSQL_DTYPE_PROMISE:
+
+#endif
+
 		case PLPGSQL_DTYPE_VAR:
 			{
 				PLpgSQL_var *var = (PLpgSQL_var *) cstate->estate->datums[dno];
@@ -1572,6 +2027,19 @@ init_datum_dno(PLpgSQL_checkstate *cstate, int dno)
 				var->freeval = false;
 			}
 			break;
+
+#if PG_VERSION_NUM >= 110000
+
+		case PLPGSQL_DTYPE_REC:
+			{
+				PLpgSQL_rec *rec = (PLpgSQL_rec *) cstate->estate->datums[dno];
+
+				recval_init(rec);
+				recval_assign_tupdesc(cstate, rec, NULL, false);
+			}
+			break;
+
+#endif
 
 		case PLPGSQL_DTYPE_ROW:
 			{
@@ -1598,13 +2066,20 @@ init_datum_dno(PLpgSQL_checkstate *cstate, int dno)
  *
  */
 PLpgSQL_datum *
-copy_plpgsql_datum(PLpgSQL_datum *datum)
+copy_plpgsql_datum(PLpgSQL_checkstate *cstate, PLpgSQL_datum *datum)
 {
 	PLpgSQL_datum *result;
 
 	switch (datum->dtype)
 	{
 		case PLPGSQL_DTYPE_VAR:
+
+#if PG_VERSION_NUM >= 110000
+
+		case PLPGSQL_DTYPE_PROMISE:
+
+#endif
+
 			{
 				PLpgSQL_var *new = palloc(sizeof(PLpgSQL_var));
 
@@ -1623,11 +2098,10 @@ copy_plpgsql_datum(PLpgSQL_datum *datum)
 				PLpgSQL_rec *new = palloc(sizeof(PLpgSQL_rec));
 
 				memcpy(new, datum, sizeof(PLpgSQL_rec));
-				/* Ensure the value is null (possibly not needed?) */
-				new->tup = NULL;
-				new->tupdesc = NULL;
-				new->freetup = false;
-				new->freetupdesc = false;
+
+				/* Ensure the value is well initialized with correct type */
+				recval_init(new);
+				recval_assign_tupdesc(cstate, new, NULL, false);
 
 				result = (PLpgSQL_datum *) new;
 			}
@@ -1662,12 +2136,13 @@ copy_plpgsql_datum(PLpgSQL_datum *datum)
  *
  */
 
+
 /*
  * walk over all plpgsql statements - search and check expressions
  *
  */
 static void
-check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
+check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt, int *closing, List **exceptions)
 {
 	TupleDesc	tupdesc = NULL;
 	PLpgSQL_function *func;
@@ -1761,13 +2236,89 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						}
 					}
 
-					check_stmts(cstate, stmt_block->body);
+					check_stmts(cstate, stmt_block->body, closing, exceptions);
 
 					if (stmt_block->exceptions)
 					{
-						foreach(l, stmt_block->exceptions->exc_list)
+						int closing_local;
+						List   *exceptions_local = NIL;
+						int		closing_handlers = PLPGSQL_CHECK_UNKNOWN;
+						List   *exceptions_transformed = NIL;
+
+						if (*closing == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS)
 						{
-							check_stmts(cstate, ((PLpgSQL_exception *) lfirst(l))->action);
+							ListCell   *lc;
+							int			i = 0;
+							int    *err_codes = NULL;
+							int		nerr_codes = 0;
+
+							/* copy errcodes to a array */
+							nerr_codes = list_length(*exceptions);
+							err_codes = palloc(sizeof(int) * nerr_codes);
+
+							foreach(lc, *exceptions)
+							{
+								err_codes[i++] = lfirst_int(lc);
+							}
+
+							foreach(l, stmt_block->exceptions->exc_list)
+							{
+								PLpgSQL_exception *exception = (PLpgSQL_exception *) lfirst(l);
+
+								/* RETURN in exception handler ~ is possible closing */
+								check_stmts(cstate, exception->action,
+												&closing_local, &exceptions_local);
+
+								if (*exceptions != NIL)
+								{
+									int		i;
+
+									for (i = 0; i < nerr_codes; i++)
+									{
+										int		err_code = err_codes[i];
+
+										if (err_code != -1 &&
+											exception_matches_conditions(err_code, exception->conditions))
+										{
+											closing_handlers = merge_closing(closing_handlers, closing_local,
+																			 &exceptions_transformed, exceptions_local,
+																			 err_code);
+											*exceptions = list_delete_int(*exceptions, err_code);
+											err_codes[i] = -1;
+										}
+									}
+								}
+							}
+
+							Assert(err_codes != NULL);
+							pfree(err_codes);
+
+							if (closing_handlers != PLPGSQL_CHECK_UNKNOWN)
+							{
+								*closing = closing_handlers;
+								if (closing_handlers == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS)
+									*exceptions = list_concat_unique_int(*exceptions, exceptions_transformed);
+								else
+									*exceptions = NIL;
+							}
+						}
+						else
+						{
+							foreach(l, stmt_block->exceptions->exc_list)
+							{
+								PLpgSQL_exception *exception = (PLpgSQL_exception *) lfirst(l);
+
+								/* RETURN in exception handler ~ it is possible closing only */
+								check_stmts(cstate, exception->action,
+												&closing_local, &exceptions_local);
+
+								closing_handlers = merge_closing(closing_handlers, closing_local,
+																 &exceptions_transformed, exceptions_local,
+																 -1);
+							}
+
+							if (closing_handlers != *closing)
+								*closing = PLPGSQL_CHECK_POSSIBLY_CLOSED;
 						}
 
 						/*
@@ -1776,8 +2327,8 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						 * should practically never be a sign of a problem, so
 						 * there's no point in annoying the user.
 						 */
-						record_variable_usage(cstate, stmt_block->exceptions->sqlstate_varno);
-						record_variable_usage(cstate, stmt_block->exceptions->sqlerrm_varno);
+						record_variable_usage(cstate, stmt_block->exceptions->sqlstate_varno, false);
+						record_variable_usage(cstate, stmt_block->exceptions->sqlerrm_varno, false);
 					}
 				}
 				break;
@@ -1813,12 +2364,22 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 
 			case PLPGSQL_STMT_IF:
 				{
-					PLpgSQL_stmt_if *stmt_if = (PLpgSQL_stmt_if *) stmt;
-					ListCell   *l;
+					PLpgSQL_stmt_if	*stmt_if = (PLpgSQL_stmt_if *) stmt;
+					ListCell    *l;
+					int		closing_local;
+					int		closing_all_paths = PLPGSQL_CHECK_UNKNOWN;
+					List   *exceptions_local;
 
 					check_expr_with_expected_scalar_type(cstate,
 									     stmt_if->cond, BOOLOID, true);
-					check_stmts(cstate, stmt_if->then_body);
+
+					check_stmts(cstate, stmt_if->then_body, &closing_local,
+								&exceptions_local);
+					closing_all_paths = merge_closing(closing_all_paths,
+													  closing_local,
+													  exceptions,
+													  exceptions_local,
+													  -1);
 
 					foreach(l, stmt_if->elsif_list)
 					{
@@ -1826,10 +2387,29 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 
 						check_expr_with_expected_scalar_type(cstate,
 										     elif->cond, BOOLOID, true);
-						check_stmts(cstate, elif->stmts);
+						check_stmts(cstate, elif->stmts, &closing_local,
+									&exceptions_local);
+						closing_all_paths = merge_closing(closing_all_paths,
+														  closing_local,
+														  exceptions,
+														  exceptions_local,
+														  -1);
 					}
 
-					check_stmts(cstate, stmt_if->else_body);
+					check_stmts(cstate, stmt_if->else_body, &closing_local,
+								&exceptions_local);
+					closing_all_paths = merge_closing(closing_all_paths,
+													  closing_local,
+													  exceptions,
+													  exceptions_local,
+													  -1);
+
+					if (stmt_if->else_body != NULL)
+						*closing = closing_all_paths;
+					else if (closing_all_paths == PLPGSQL_CHECK_UNCLOSED)
+						*closing = PLPGSQL_CHECK_UNCLOSED;
+					else
+						*closing = PLPGSQL_CHECK_POSSIBLY_CLOSED;
 				}
 				break;
 
@@ -1837,6 +2417,9 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 				{
 					PLpgSQL_stmt_case *stmt_case = (PLpgSQL_stmt_case *) stmt;
 					Oid			result_oid;
+					int		closing_local;
+					List	*exceptions_local;
+					int		closing_all_paths = PLPGSQL_CHECK_UNKNOWN;
 
 					if (stmt_case->t_expr != NULL)
 					{
@@ -1846,13 +2429,18 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						 * we need to set hidden variable type
 						 */
 						prepare_expr(cstate, stmt_case->t_expr, 0);
+
+						/* record all variables used by the query */
+						cstate->used_variables = bms_add_members(cstate->used_variables,
+																 stmt_case->t_expr->paramnos);
+
 						tupdesc = expr_get_desc(cstate,
 												stmt_case->t_expr,
 												false,	/* no element type */
 												true,	/* expand record */
 												true,	/* is expression */
 												NULL);
-						result_oid = tupdesc->attrs[0]->atttypid;
+						result_oid = TupleDescAttr(tupdesc, 0)->atttypid;
 
 						/*
 						 * When expected datatype is different from real,
@@ -1871,35 +2459,59 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						PLpgSQL_case_when *cwt = (PLpgSQL_case_when *) lfirst(l);
 
 						check_expr(cstate, cwt->expr);
-						check_stmts(cstate, cwt->stmts);
+						check_stmts(cstate, cwt->stmts, &closing_local, &exceptions_local);
+						closing_all_paths = merge_closing(closing_all_paths,
+														  closing_local,
+														  exceptions,
+														  exceptions_local,
+														  -1);
 					}
 
-					check_stmts(cstate, stmt_case->else_stmts);
+					if (stmt_case->else_stmts)
+					{
+						check_stmts(cstate, stmt_case->else_stmts, &closing_local, &exceptions_local);
+						*closing = merge_closing(closing_all_paths,
+														  closing_local,
+														  exceptions,
+														  exceptions_local,
+														  -1);
+					}
+					else
+						/* is not ensured all path evaluation */
+						*closing = possibly_closed(closing_all_paths);
 				}
 				break;
 
 			case PLPGSQL_STMT_LOOP:
-				check_stmts(cstate, ((PLpgSQL_stmt_loop *) stmt)->body);
+				check_stmts(cstate, ((PLpgSQL_stmt_loop *) stmt)->body, closing, exceptions);
 				break;
 
 			case PLPGSQL_STMT_WHILE:
 				{
 					PLpgSQL_stmt_while *stmt_while = (PLpgSQL_stmt_while *) stmt;
+					int		closing_local;
+					List   *exceptions_local;
 
 					check_expr_with_expected_scalar_type(cstate,
 										     stmt_while->cond,
 										     BOOLOID,
 										     true);
 
-					check_expr(cstate, stmt_while->cond);
-					check_stmts(cstate, stmt_while->body);
+					/*
+					 * When is not guaranteed execution (possible zero loops),
+					 * then ignore closing info from body.
+					 */
+					check_stmts(cstate, stmt_while->body, &closing_local, &exceptions_local);
+					*closing = possibly_closed(closing_local);
 				}
 				break;
 
 			case PLPGSQL_STMT_FORI:
 				{
 					PLpgSQL_stmt_fori *stmt_fori = (PLpgSQL_stmt_fori *) stmt;
-					int	dno = stmt_fori->var->dno;
+					int			dno = stmt_fori->var->dno;
+					int		closing_local;
+					List   *exceptions_local;
 
 					/* prepare plan if desn't exist yet */
 					check_assignment(cstate, stmt_fori->lower, NULL, NULL, dno);
@@ -1908,13 +2520,26 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 					if (stmt_fori->step)
 						check_assignment(cstate, stmt_fori->step, NULL, NULL, dno);
 
-					check_stmts(cstate, stmt_fori->body);
+					check_stmts(cstate, stmt_fori->body, &closing_local, &exceptions_local);
+					*closing = possibly_closed(closing_local);
 				}
 				break;
 
 			case PLPGSQL_STMT_FORS:
 				{
 					PLpgSQL_stmt_fors *stmt_fors = (PLpgSQL_stmt_fors *) stmt;
+					int		closing_local;
+					List   *exceptions_local;
+
+#if PG_VERSION_NUM >= 110000
+
+					check_variable(cstate, stmt_fors->var);
+
+					/* we need to set hidden variable type */
+					check_assignment_to_variable(cstate, stmt_fors->query,
+									 stmt_fors->var, -1);
+
+#else
 
 					check_row_or_rec(cstate, stmt_fors->row, stmt_fors->rec);
 
@@ -1922,7 +2547,10 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 					check_assignment(cstate, stmt_fors->query,
 									 stmt_fors->rec, stmt_fors->row, -1);
 
-					check_stmts(cstate, stmt_fors->body);
+#endif
+
+					check_stmts(cstate, stmt_fors->body, &closing_local, &exceptions_local);
+					*closing = possibly_closed(closing_local);
 				}
 				break;
 
@@ -1930,16 +2558,37 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 				{
 					PLpgSQL_stmt_forc *stmt_forc = (PLpgSQL_stmt_forc *) stmt;
 					PLpgSQL_var *var = (PLpgSQL_var *) func->datums[stmt_forc->curvar];
+					int		closing_local;
+					List   *exceptions_local;
+
+#if PG_VERSION_NUM >= 110000
+
+					check_variable(cstate, stmt_forc->var);
+
+#else
 
 					check_row_or_rec(cstate, stmt_forc->row, stmt_forc->rec);
 
+#endif
+
 					check_expr(cstate, stmt_forc->argquery);
+
+#if PG_VERSION_NUM >= 110000
+
+					if (var->cursor_explicit_expr != NULL)
+						check_assignment_to_variable(cstate, var->cursor_explicit_expr,
+										 stmt_forc->var, -1);
+
+#else
 
 					if (var->cursor_explicit_expr != NULL)
 						check_assignment(cstate, var->cursor_explicit_expr,
 										 stmt_forc->rec, stmt_forc->row, -1);
 
-					check_stmts(cstate, stmt_forc->body);
+#endif
+
+					check_stmts(cstate, stmt_forc->body, &closing_local, &exceptions_local);
+					*closing = possibly_closed(closing_local);
 
 					cstate->used_variables = bms_add_member(cstate->used_variables,
 										 stmt_forc->curvar);
@@ -1949,8 +2598,36 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 			case PLPGSQL_STMT_DYNFORS:
 				{
 					PLpgSQL_stmt_dynfors *stmt_dynfors = (PLpgSQL_stmt_dynfors *) stmt;
+					int		closing_local;
+					List   *exceptions_local;
+
+#if PG_VERSION_NUM >= 110000
+
+					check_variable(cstate, stmt_dynfors->var);
+
+#else
+
+					check_row_or_rec(cstate, stmt_dynfors->row, stmt_dynfors->rec);
+
+#endif
+
+					check_expr(cstate, stmt_dynfors->query);
+
+					foreach(l, stmt_dynfors->params)
+					{
+						check_expr(cstate, (PLpgSQL_expr *) lfirst(l));
+					}
+
+#if PG_VERSION_NUM >= 110000
+
+					if (stmt_dynfors->var->dtype == PLPGSQL_DTYPE_REC)
+
+#else
 
 					if (stmt_dynfors->rec != NULL)
+
+#endif
+
 					{
 						put_error(cstate,
 									  0, 0,
@@ -1959,21 +2636,10 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 					  "Don't use dynamic SQL and record type together, when you would check function.",
 									  PLPGSQL_CHECK_WARNING_OTHERS,
 									  0, NULL, NULL);
-
-						/*
-						 * don't continue in checking. Behave should be
-						 * indeterministic.
-						 */
-						break;
-					}
-					check_expr(cstate, stmt_dynfors->query);
-
-					foreach(l, stmt_dynfors->params)
-					{
-						check_expr(cstate, (PLpgSQL_expr *) lfirst(l));
 					}
 
-					check_stmts(cstate, stmt_dynfors->body);
+					check_stmts(cstate, stmt_dynfors->body, &closing_local, &exceptions_local);
+					*closing = possibly_closed(closing_local);
 				}
 				break;
 
@@ -1981,6 +2647,8 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 				{
 					PLpgSQL_stmt_foreach_a *stmt_foreach_a = (PLpgSQL_stmt_foreach_a *) stmt;
 					bool use_element_type;
+					int		closing_local;
+					List   *exceptions_local;
 
 					check_target(cstate, stmt_foreach_a->varno, NULL, NULL);
 
@@ -1996,7 +2664,8 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 											 stmt_foreach_a->varno,
 											 use_element_type);
 
-					check_stmts(cstate, stmt_foreach_a->body);
+					check_stmts(cstate, stmt_foreach_a->body, &closing_local, &exceptions_local);
+					*closing = possibly_closed(closing_local);
 				}
 				break;
 
@@ -2004,7 +2673,10 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 				{
 					PLpgSQL_stmt_exit *stmt_exit = (PLpgSQL_stmt_exit *) stmt;
 
-					check_expr(cstate, stmt_exit->cond);
+					check_expr_with_expected_scalar_type(cstate,
+										     stmt_exit->cond,
+										     BOOLOID,
+										     false);
 
 					if (stmt_exit->label != NULL)
 					{
@@ -2035,6 +2707,20 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 
 			case PLPGSQL_STMT_PERFORM:
 				check_expr(cstate, ((PLpgSQL_stmt_perform *) stmt)->expr);
+
+				/*
+				 * Note: if you want to raise warning when used expressions returns
+				 * some value (other than VOID type), change previous command check_expr
+				 * to following check_expr_with_expected_scalar_type. This should be 
+				 * not enabled by default, because PERFORM can be used with reason
+				 * to ignore result.
+				 *
+				 * check_expr_with_expected_scalar_type(cstate,
+				 * 					     ((PLpgSQL_stmt_perform *) stmt)->expr,
+				 * 					     VOIDOID,
+				 * 					     true);
+				 */
+
 				break;
 
 			case PLPGSQL_STMT_RETURN:
@@ -2064,12 +2750,12 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 								{
 									PLpgSQL_rec *rec = (PLpgSQL_rec *) retvar;
 
-									if (rec->tupdesc && estate->rsi && IsA(estate->rsi, ReturnSetInfo))
+									if (recvar_tupdesc(rec) && estate->rsi && IsA(estate->rsi, ReturnSetInfo))
 									{
 										TupleDesc	rettupdesc = estate->rsi->expectedDesc;
 										TupleConversionMap *tupmap ;
 
-										tupmap = convert_tuples_by_position(rec->tupdesc, rettupdesc,
+										tupmap = convert_tuples_by_position(recvar_tupdesc(rec), rettupdesc,
 											 gettext_noop("returned record type does not match expected record type"));
 
 										if (tupmap)
@@ -2101,6 +2787,8 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						}
 					}
 
+					*closing = PLPGSQL_CHECK_CLOSED;
+
 					if (stmt_rt->expr)
 						check_returned_expr(cstate, stmt_rt->expr, true);
 				}
@@ -2124,9 +2812,18 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 									(errcode(ERRCODE_SYNTAX_ERROR),
 									 errmsg("cannot use RETURN NEXT in a non-SETOF function")));
 
+#if PG_VERSION_NUM >= 110000
+
+						tupdesc = estate->tuple_store_desc;
+
+#else
+
 						tupdesc = estate->rettupdesc;
+
+#endif
+
 						natts = tupdesc ? tupdesc->natts : 0;
-	
+
 						switch (retvar->dtype)
 						{
 							case PLPGSQL_DTYPE_VAR:
@@ -2149,7 +2846,7 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 									PLpgSQL_rec *rec = (PLpgSQL_rec *) retvar;
 									TupleConversionMap *tupmap;
 
-									if (!HeapTupleIsValid(rec->tup))
+									if (!HeapTupleIsValid(recvar_tuple(rec)))
 										ereport(ERROR,
 												  (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 												   errmsg("record \"%s\" is not assigned yet",
@@ -2159,7 +2856,7 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 
 									if (tupdesc)
 									{
-										tupmap = convert_tuples_by_position(rec->tupdesc,
+										tupmap = convert_tuples_by_position(recvar_tupdesc(rec),
 																tupdesc,
 											gettext_noop("wrong record type supplied in RETURN NEXT"));
 										if (tupmap)
@@ -2185,13 +2882,13 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 											{
 												PLpgSQL_var *var;
 
-												if (tupdesc->attrs[i]->attisdropped)
+												if (TupleDescAttr(tupdesc, i)->attisdropped)
 													continue;
 												if (row->varnos[i] < 0)
 													elog(ERROR, "dropped rowtype entry for non-dropped column");
 
 												var = (PLpgSQL_var *) (cstate->estate->datums[row->varnos[i]]);
-												if (var->datatype->typoid != tupdesc->attrs[i]->atttypid)
+												if (var->datatype->typoid != TupleDescAttr(tupdesc, i)->atttypid)
 												{
 													row_is_valid_result = false;
 													break;
@@ -2226,7 +2923,10 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 					check_expr(cstate, stmt_rq->dynquery);
 
 					if (stmt_rq->query)
+					{
 						check_returned_expr(cstate, stmt_rq->query, false);
+						cstate->found_return_query = true;
+					}
 
 					foreach(l, stmt_rq->params)
 					{
@@ -2240,6 +2940,10 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 					PLpgSQL_stmt_raise *stmt_raise = (PLpgSQL_stmt_raise *) stmt;
 					ListCell   *current_param;
 					char	   *cp;
+					int			err_code = 0;
+
+					if (stmt_raise->condname != NULL)
+						err_code = plpgsql_recognize_err_condition(stmt_raise->condname, true);
 
 					foreach(l, stmt_raise->params)
 					{
@@ -2251,6 +2955,17 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						PLpgSQL_raise_option *opt = (PLpgSQL_raise_option *) lfirst(l);
 
 						check_expr(cstate, opt->expr);
+
+						if (opt->opt_type == PLPGSQL_RAISEOPTION_ERRCODE)
+						{
+							bool		IsConst;
+							char	   *value = ExprGetString(cstate, opt->expr, &IsConst);
+
+							if (IsConst && value != NULL)
+								err_code = plpgsql_recognize_err_condition(value, true);
+							else
+								err_code = -1;		/* cannot be calculated now */
+						}
 					}
 
 					current_param = list_head(stmt_raise->params);
@@ -2280,6 +2995,24 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("too many parameters specified for RAISE")));
+
+					if (stmt_raise->elog_level >= ERROR)
+					{
+						*closing = PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS;
+						if (err_code == 0)
+							err_code = ERRCODE_RAISE_EXCEPTION;
+						else if (err_code == -1)
+							err_code = 0; /* cannot be calculated */
+						*exceptions = list_make1_int(err_code);
+					}
+					/* without any parameters it is reRAISE */
+					if (stmt_raise->condname == NULL && stmt_raise->message == NULL &&
+						stmt_raise->options == NIL)
+					{
+						*closing = PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS;
+						/* should be enhanced in future */
+						*exceptions = list_make1_int(-2); /* reRAISE */
+					}
 				}
 				break;
 
@@ -2289,9 +3022,21 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 
 					if (stmt_execsql->into)
 					{
+
+#if PG_VERSION_NUM >= 110000
+
+						check_variable(cstate, stmt_execsql->target);
+						check_assignment_to_variable(cstate, stmt_execsql->sqlstmt,
+													  stmt_execsql->target, -1);
+
+#else
+
 						check_row_or_rec(cstate, stmt_execsql->row, stmt_execsql->rec);
 						check_assignment(cstate, stmt_execsql->sqlstmt,
 								   stmt_execsql->rec, stmt_execsql->row, -1);
+
+#endif
+
 					}
 					else
 						/* only statement */
@@ -2312,9 +3057,21 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 
 					if (stmt_dynexecute->into)
 					{
+
+#if PG_VERSION_NUM >= 110000
+
+						check_variable(cstate, stmt_dynexecute->target);
+
+						if (stmt_dynexecute->target->dtype == PLPGSQL_DTYPE_REC)
+
+#else
+
 						check_row_or_rec(cstate, stmt_dynexecute->row, stmt_dynexecute->rec);
 
 						if (stmt_dynexecute->rec != NULL)
+
+#endif
+
 						{
 							put_error(cstate,
 										  0, 0,
@@ -2323,12 +3080,6 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 						  "Don't use dynamic SQL and record type together, when you would check function.",
 										  PLPGSQL_CHECK_WARNING_OTHERS,
 										  0, NULL, NULL);
-
-							/*
-							 * don't continue in checking. Behave should be
-							 * indeterministic.
-							 */
-							break;
 						}
 					}
 				}
@@ -2340,9 +3091,11 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 					PLpgSQL_var *var = (PLpgSQL_var *) (cstate->estate->datums[stmt_open->curvar]);
 
 					if (var->cursor_explicit_expr)
-						check_expr(cstate, var->cursor_explicit_expr);
+						check_expr_as_sqlstmt_data(cstate, var->cursor_explicit_expr);
 
-					check_expr(cstate, stmt_open->query);
+					if (stmt_open->query)
+						check_expr_as_sqlstmt_data(cstate, stmt_open->query);
+
 					if (var != NULL && stmt_open->query != NULL)
 						var->cursor_explicit_expr = stmt_open->query;
 
@@ -2378,11 +3131,25 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 					PLpgSQL_stmt_fetch *stmt_fetch = (PLpgSQL_stmt_fetch *) stmt;
 					PLpgSQL_var *var = (PLpgSQL_var *) (cstate->estate->datums[stmt_fetch->curvar]);
 
+#if PG_VERSION_NUM >= 110000
+
+					check_variable(cstate, stmt_fetch->target);
+
+					if (var != NULL && var->cursor_explicit_expr != NULL)
+						check_assignment_to_variable(cstate, var->cursor_explicit_expr,
+									   stmt_fetch->target, -1);
+
+#else
+
 					check_row_or_rec(cstate, stmt_fetch->row, stmt_fetch->rec);
 
 					if (var != NULL && var->cursor_explicit_expr != NULL)
 						check_assignment(cstate, var->cursor_explicit_expr,
 									   stmt_fetch->rec, stmt_fetch->row, -1);
+
+#endif
+
+					check_expr(cstate, stmt_fetch->expr);
 
 					cstate->used_variables = bms_add_member(cstate->used_variables, stmt_fetch->curvar);
 				}
@@ -2393,6 +3160,52 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
 								 ((PLpgSQL_stmt_close *) stmt)->curvar);
 
 				break;
+
+#if PG_VERSION_NUM >= 110000
+
+			case PLPGSQL_STMT_SET:
+				/*
+				 * We can not check this now, syntax should be ok.
+				 * The expression there has not plan.
+				 */
+				break;
+
+			case PLPGSQL_STMT_COMMIT:
+			case PLPGSQL_STMT_ROLLBACK:
+				/* These commands are allowed only in procedures */
+				if (!is_procedure(cstate->estate))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
+							 errmsg("invalid transaction termination")));
+				break;
+
+			case PLPGSQL_STMT_CALL:
+				{
+					PLpgSQL_stmt_call *stmt_call = (PLpgSQL_stmt_call *) stmt;
+					PLpgSQL_row *target;
+					bool		has_data;
+
+					has_data = check_expr_as_sqlstmt(cstate, stmt_call->expr);
+
+					/* any check_expr_xxx should be called before CallExprGetRowTarget */
+					target = CallExprGetRowTarget(cstate, stmt_call->expr);
+
+					if (has_data != (target != NULL))
+						elog(ERROR, "plpgsql internal error, broken CALL statement");
+
+					if (target != NULL)
+					{
+						check_variable(cstate, (PLpgSQL_variable *) target);
+						check_assignment_to_variable(cstate, stmt_call->expr,
+																(PLpgSQL_variable *) target, -1);
+
+						pfree(target->varnos);
+						pfree(target);
+					}
+				}
+				break;
+
+#endif
 
 			default:
 				elog(ERROR, "unrecognized cmd_type: %d", stmt->cmd_type);
@@ -2442,14 +3255,164 @@ check_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_stmt *stmt)
  *
  */
 static void
-check_stmts(PLpgSQL_checkstate *cstate, List *stmts)
+check_stmts(PLpgSQL_checkstate *cstate, List *stmts, int *closing, List **exceptions)
 {
 	ListCell   *lc;
+	int			closing_local;
+	List	   *exceptions_local;
+	bool		dead_code_alert = false;
+
+	*closing = PLPGSQL_CHECK_UNCLOSED;
+	*exceptions = NIL;
 
 	foreach(lc, stmts)
 	{
-		check_stmt(cstate, (PLpgSQL_stmt *) lfirst(lc));
+		PLpgSQL_stmt	   *stmt = (PLpgSQL_stmt *) lfirst(lc);
+
+		closing_local = PLPGSQL_CHECK_UNCLOSED;
+		exceptions_local = NIL;
+		check_stmt(cstate, stmt, &closing_local, &exceptions_local);
+
+		if (dead_code_alert)
+		{
+			put_error(cstate,
+						  0, stmt->lineno,
+						  "unreachable code",
+						  NULL,
+						  NULL,
+						  PLPGSQL_CHECK_WARNING_EXTRA,
+						  0, NULL, NULL);
+			/* don't raise this warning every line */
+			dead_code_alert = false;
+		}
+
+		if (closing_local == PLPGSQL_CHECK_CLOSED)
+		{
+			dead_code_alert = true;
+			*closing = PLPGSQL_CHECK_CLOSED;
+			*exceptions = NIL;
+		}
+		else if (closing_local == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS)
+		{
+			dead_code_alert = true;
+			if (*closing == PLPGSQL_CHECK_UNCLOSED ||
+				*closing == PLPGSQL_CHECK_POSSIBLY_CLOSED ||
+				*closing == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS)
+			{
+				*closing = PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS;
+				*exceptions = exceptions_local;
+			}
+		}
+		else if (closing_local == PLPGSQL_CHECK_POSSIBLY_CLOSED)
+		{
+			if (*closing == PLPGSQL_CHECK_UNCLOSED)
+			{
+				*closing = PLPGSQL_CHECK_POSSIBLY_CLOSED;
+				*exceptions = NIL;
+			}
+		}
 	}
+}
+
+static int
+possibly_closed(int c)
+{
+	switch (c)
+	{
+		case PLPGSQL_CHECK_CLOSED:
+		case PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS:
+		case PLPGSQL_CHECK_POSSIBLY_CLOSED:
+			return PLPGSQL_CHECK_POSSIBLY_CLOSED;
+		default:
+			return PLPGSQL_CHECK_UNCLOSED;
+	}
+}
+
+static int
+merge_closing(int c, int c_local, List **exceptions, List *exceptions_local, int err_code)
+{
+	*exceptions = NIL;
+
+	if (c == PLPGSQL_CHECK_UNKNOWN)
+	{
+		if (c_local == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS)
+			*exceptions = exceptions_local;
+
+		return c_local;
+	}
+
+	if (c_local == PLPGSQL_CHECK_UNKNOWN)
+		return c;
+
+	if (c == c_local)
+	{
+		if (c == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS)
+		{
+
+			if (err_code != -1)
+			{
+				ListCell *lc;
+
+				/* replace reRAISE symbol (-2) by real err_code */
+				foreach(lc, exceptions_local)
+				{
+					int		t_err_code = lfirst_int(lc);
+
+					*exceptions = list_append_unique_int(*exceptions,
+														t_err_code != -2 ? t_err_code : err_code);
+				}
+			}
+			else
+				*exceptions = list_concat_unique_int(*exceptions, exceptions_local);
+		}
+
+		return c_local;
+	}
+
+	if (c == PLPGSQL_CHECK_CLOSED || c_local == PLPGSQL_CHECK_CLOSED)
+	{
+		if (c == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS ||
+			c_local == PLPGSQL_CHECK_CLOSED_BY_EXCEPTIONS)
+		return PLPGSQL_CHECK_CLOSED;
+	}
+
+	return PLPGSQL_CHECK_POSSIBLY_CLOSED;
+}
+
+static bool
+exception_matches_conditions(int sqlerrstate, PLpgSQL_condition *cond)
+{
+	for (; cond != NULL; cond = cond->next)
+	{
+		int			_sqlerrstate = cond->sqlerrstate;
+
+		/*
+		 * OTHERS matches everything *except* query-canceled and
+		 * assert-failure.  If you're foolish enough, you can match those
+		 * explicitly.
+		 */
+		if (_sqlerrstate == 0)
+		{
+			if (sqlerrstate != ERRCODE_QUERY_CANCELED
+
+#if PG_VERSION_NUM >= 90500
+
+				 && sqlerrstate != ERRCODE_ASSERT_FAILURE
+
+#endif
+
+				)
+				return true;
+		}
+		/* Exact match? */
+		else if (sqlerrstate == _sqlerrstate)
+			return true;
+		/* Category match? */
+		else if (ERRCODE_IS_CATEGORY(_sqlerrstate) &&
+				 ERRCODE_TO_CATEGORY(sqlerrstate) == _sqlerrstate)
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -2460,20 +3423,48 @@ static void
 check_expr(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
 {
 	if (expr)
-		check_expr_as_rvalue(cstate, expr, NULL, NULL, -1, false, false);
+		check_expr_as_rvalue(cstate, expr, NULL, NULL, -1, false, true);
 }
 
 static void
-record_variable_usage(PLpgSQL_checkstate *cstate, int dno)
+record_variable_usage(PLpgSQL_checkstate *cstate, int dno, bool write)
 {
 	if (dno >= 0)
-		cstate->used_variables = bms_add_member(cstate->used_variables, dno);
+	{
+		if (!write)
+			cstate->used_variables = bms_add_member(cstate->used_variables, dno);
+		else
+			cstate->modif_variables = bms_add_member(cstate->modif_variables, dno);
+	}
 }
 
-/*
- * returns true, when datum or some child is used */
 static bool
-datum_is_used(PLpgSQL_checkstate *cstate, int dno)
+is_internal(char *refname, int lineno)
+{
+	if (lineno <= 0)
+		return true;
+	if (refname == NULL)
+		return true;
+	if (strcmp(refname, "*internal*") == 0)
+		return true;
+	if (strcmp(refname, "(unnamed row)") == 0)
+		return true;
+	return false;
+}
+
+static bool
+is_internal_variable(PLpgSQL_variable *var)
+{
+	return is_internal(var->refname, var->lineno);
+}
+
+
+/*
+ * Returns true if dno is explicitly declared. It should not be used
+ * for arguments.
+ */
+static bool
+datum_is_explicit(PLpgSQL_checkstate *cstate, int dno)
 {
 	PLpgSQL_execstate *estate = cstate->estate;
 
@@ -2481,13 +3472,40 @@ datum_is_used(PLpgSQL_checkstate *cstate, int dno)
 	{
 		case PLPGSQL_DTYPE_VAR:
 			{
-				PLpgSQL_var *var = (PLpgSQL_var *) estate->datums[dno];
+				PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[dno];
+				return !is_internal(var->refname, var->lineno);
+			}
 
-				/* don't check internal variables */
-				if (var->lineno < 1)
-					return true;
+		case PLPGSQL_DTYPE_ROW:
+			{
+				PLpgSQL_row *row = (PLpgSQL_row *) estate->datums[dno];
+				return !is_internal(row->refname, row->lineno);
+			}
+		case PLPGSQL_DTYPE_REC:
+			{
+				PLpgSQL_rec *rec = (PLpgSQL_rec *) estate->datums[dno];
+				return !is_internal(rec->refname, rec->lineno);
+			}
 
-				return bms_is_member(dno, cstate->used_variables);
+		default:
+			return false;
+	}
+}
+
+/*
+ * returns true, when datum or some child is used
+ */
+static bool
+datum_is_used(PLpgSQL_checkstate *cstate, int dno, bool write)
+{
+	PLpgSQL_execstate *estate = cstate->estate;
+
+	switch (estate->datums[dno]->dtype)
+	{
+		case PLPGSQL_DTYPE_VAR:
+			{
+				return bms_is_member(dno,
+						write ? cstate->modif_variables : cstate->used_variables);
 			}
 			break;
 
@@ -2496,14 +3514,8 @@ datum_is_used(PLpgSQL_checkstate *cstate, int dno)
 				PLpgSQL_row *row = (PLpgSQL_row *) estate->datums[dno];
 				int	     i;
 
-				if (row->lineno < 1)
-					return true;
-
-				/* skip internal vars created for INTO lists  */
-				if (row->rowtupdesc == NULL)
-					return true;
-
-				if (bms_is_member(dno, cstate->used_variables))
+				if (bms_is_member(dno,
+						  write ? cstate->modif_variables : cstate->used_variables))
 					return true;
 
 				for (i = 0; i < row->nfields; i++)
@@ -2511,9 +3523,11 @@ datum_is_used(PLpgSQL_checkstate *cstate, int dno)
 					if (row->varnos[i] < 0)
 						continue;
 
-					if (datum_is_used(cstate, row->varnos[i]))
+					if (datum_is_used(cstate, row->varnos[i], write))
 						return true;
 				}
+
+				return false;
 			}
 			break;
 
@@ -2522,10 +3536,8 @@ datum_is_used(PLpgSQL_checkstate *cstate, int dno)
 				PLpgSQL_rec *rec = (PLpgSQL_rec *) estate->datums[dno];
 				int	     i;
 
-				if (rec->lineno < 1)
-					return true;
-
-				if (bms_is_member(dno, cstate->used_variables))
+				if (bms_is_member(dno,
+						  write ? cstate->modif_variables : cstate->used_variables))
 					return true;
 
 				/* search any used recfield with related recparentno */
@@ -2536,18 +3548,19 @@ datum_is_used(PLpgSQL_checkstate *cstate, int dno)
 						PLpgSQL_recfield *recfield = (PLpgSQL_recfield *) estate->datums[i];
 
 						if (recfield->recparentno == rec->dno
-								    && bms_is_member(i, cstate->used_variables))
+								    && datum_is_used(cstate, i, write))
 							return true;
 					}
 				}
 			}
 			break;
 
-		/* these types are not individual variables, should not be unused variable */
 		case PLPGSQL_DTYPE_RECFIELD:
-		case PLPGSQL_DTYPE_ARRAYELEM:
-		case PLPGSQL_DTYPE_EXPR:
-			return true;
+			return bms_is_member(dno,
+					write ? cstate->modif_variables : cstate->used_variables);
+
+		default:
+			return false;
 	}
 
 	return false;
@@ -2555,10 +3568,16 @@ datum_is_used(PLpgSQL_checkstate *cstate, int dno)
 
 #define UNUSED_VARIABLE_TEXT			"unused variable \"%s\""
 #define UNUSED_VARIABLE_TEXT_CHECK_LENGTH	15
+#define NEVER_READ_VARIABLE_TEXT		"never read variable \"%s\""
+#define NEVER_READ_VARIABLE_TEXT_CHECK_LENGTH		19
+#define UNUSED_PARAMETER_TEXT			"unused parameter \"%s\""
+#define NEVER_READ_PARAMETER_TEXT		"parameter \"%s\" is never read"
+#define UNMODIFIED_VARIABLE_TEXT		"unmodified OUT variable \"%s\""
+#define OUT_COMPOSITE_IS_NOT_SINGLE_TEXT	"composite OUT variable \"%s\" is not single argument"
 
 /*
- * Reports all unused variables explicitly DECLAREd by the user.  Ignores IN
- * and OUT variables and special variables created by PL/PgSQL.
+ * Reports all unused variables explicitly DECLAREd by the user.  Ignores
+ * special variables created by PL/PgSQL.
  */
 static void
 report_unused_variables(PLpgSQL_checkstate *cstate)
@@ -2570,7 +3589,8 @@ report_unused_variables(PLpgSQL_checkstate *cstate)
 	estate->err_stmt = NULL;
 
 	for (i = 0; i < estate->ndatums; i++)
-		if (!datum_is_used(cstate, i))
+		if (datum_is_explicit(cstate, i) &&
+			!(datum_is_used(cstate, i, false) || datum_is_used(cstate, i, true)))
 		{
 			PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[i];
 			StringInfoData message;
@@ -2586,8 +3606,164 @@ report_unused_variables(PLpgSQL_checkstate *cstate)
 					  PLPGSQL_CHECK_WARNING_OTHERS,
 					  0, NULL, NULL);
 
-			pfree(message.data); message.data = NULL;
+			pfree(message.data);
+			message.data = NULL;
 		}
+
+	if (cstate->extra_warnings)
+	{
+		PLpgSQL_function *func = estate->func;
+
+		/* check never read variables */
+
+		for (i = 0; i < estate->ndatums; i++)
+		{
+			if (datum_is_explicit(cstate, i)
+				 && !datum_is_used(cstate, i, false) && datum_is_used(cstate, i, true))
+			{
+				PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[i];
+				StringInfoData message;
+
+				initStringInfo(&message);
+
+				appendStringInfo(&message, NEVER_READ_VARIABLE_TEXT, var->refname);
+				put_error(cstate,
+						  0, var->lineno,
+						  message.data,
+						  NULL,
+						  NULL,
+						  PLPGSQL_CHECK_WARNING_EXTRA,
+						  0, NULL, NULL);
+
+				pfree(message.data);
+				message.data = NULL;
+			}
+		}
+
+		/* check IN parameters */
+		for (i = 0; i < func->fn_nargs; i++)
+		{
+			int		varno = func->fn_argvarnos[i];
+
+			bool	is_read = datum_is_used(cstate, varno, false);
+			bool	is_write = datum_is_used(cstate, varno, true);
+
+			if (!is_read)
+			{
+				PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[varno];
+				StringInfoData message;
+
+				initStringInfo(&message);
+
+				appendStringInfo(&message, NEVER_READ_PARAMETER_TEXT, var->refname);
+				put_error(cstate,
+						  0, 0,
+						  message.data,
+						  NULL,
+						  NULL,
+						  PLPGSQL_CHECK_WARNING_EXTRA,
+						  0, NULL, NULL);
+
+				pfree(message.data); message.data = NULL;
+			}
+			else if (!(is_read || is_write))
+			{
+				PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[varno];
+				StringInfoData message;
+
+				initStringInfo(&message);
+
+				appendStringInfo(&message, UNUSED_PARAMETER_TEXT, var->refname);
+				put_error(cstate,
+						  0, 0,
+						  message.data,
+						  NULL,
+						  NULL,
+						  PLPGSQL_CHECK_WARNING_EXTRA,
+						  0, NULL, NULL);
+
+				pfree(message.data); message.data = NULL;
+			}
+		}
+
+		/* are there some OUT parameters (expect modification)? */
+		if (func->out_param_varno != -1 && !cstate->found_return_query)
+		{
+			int		varno = func->out_param_varno;
+			PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[varno];
+
+			if (var->dtype == PLPGSQL_DTYPE_ROW && is_internal_variable(var))
+			{
+				/* this function has more OUT parameters */
+				PLpgSQL_row *row = (PLpgSQL_row*) var;
+				int		fnum;
+
+				for (fnum = 0; fnum < row->nfields; fnum++)
+				{
+					int		varno2 = row->varnos[fnum];
+					PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[varno2];
+					StringInfoData message;
+
+					if (var->dtype == PLPGSQL_DTYPE_ROW ||
+						  var->dtype == PLPGSQL_DTYPE_REC)
+					{
+						initStringInfo(&message);
+						appendStringInfo(&message,
+									  OUT_COMPOSITE_IS_NOT_SINGLE_TEXT, var->refname);
+						put_error(cstate,
+								  0, 0,
+								  message.data,
+								  NULL,
+								  NULL,
+								  PLPGSQL_CHECK_WARNING_EXTRA,
+								  0, NULL, NULL);
+
+						pfree(message.data);
+						message.data = NULL;
+					}
+
+					if (!datum_is_used(cstate, varno2, true))
+					{
+						initStringInfo(&message);
+						appendStringInfo(&message, UNMODIFIED_VARIABLE_TEXT, var->refname);
+						put_error(cstate,
+								  0, 0,
+								  message.data,
+								  NULL,
+								  NULL,
+								  PLPGSQL_CHECK_WARNING_EXTRA,
+								  0, NULL, NULL);
+
+						pfree(message.data);
+						message.data = NULL;
+					}
+				}
+			}
+			else
+			{
+				if (!datum_is_used(cstate, varno, true))
+				{
+					PLpgSQL_variable *var = (PLpgSQL_variable *) estate->datums[varno];
+					StringInfoData message;
+
+					initStringInfo(&message);
+
+					appendStringInfo(&message, UNMODIFIED_VARIABLE_TEXT, var->refname);
+					put_error(cstate,
+							  0, 0,
+							  message.data,
+							  NULL,
+							  NULL,
+							  PLPGSQL_CHECK_WARNING_EXTRA,
+							  0, NULL, NULL);
+
+					pfree(message.data);
+					message.data = NULL;
+				}
+			}
+
+		}
+	}
 }
 
 /*
@@ -2604,6 +3780,31 @@ check_assignment(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr,
 	check_expr_as_rvalue(cstate, expr, targetrec, targetrow, targetdno, false,
 						  is_expression);
 }
+
+#if PG_VERSION_NUM >= 110000
+
+static void
+check_assignment_to_variable(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr,
+				 PLpgSQL_variable *targetvar, int targetdno)
+{
+	if (targetvar != NULL)
+	{
+		if (targetvar->dtype == PLPGSQL_DTYPE_ROW)
+			check_expr_as_rvalue(cstate, expr, NULL, (PLpgSQL_row *) targetvar, targetdno,
+								  false, false);
+		else if (targetvar->dtype == PLPGSQL_DTYPE_REC)
+			check_expr_as_rvalue(cstate, expr, (PLpgSQL_rec *) targetvar, NULL, targetdno,
+								  false, false);
+		else
+			elog(ERROR, "unsupported target variable type");
+	}
+	else
+	{
+		check_expr_as_rvalue(cstate, expr, NULL, NULL, targetdno, false, true);
+	}
+}
+
+#endif
 
 /*
  * Verify an assignment of 'expr' to 'target' with possible slices
@@ -2635,77 +3836,77 @@ check_expr_with_expected_scalar_type(PLpgSQL_checkstate *cstate,
 	ResourceOwner oldowner;
 	MemoryContext oldCxt = CurrentMemoryContext;
 
-	oldowner = CurrentResourceOwner;
-	BeginInternalSubTransaction(NULL);
-	MemoryContextSwitchTo(oldCxt);
-
 	if (!expr)
 	{
 		if (required)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("required expression is empty")));
+
+		return;
 	}
-	else
+
+	oldowner = CurrentResourceOwner;
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldCxt);
+
+	PG_TRY();
 	{
-		PG_TRY();
+		TupleDesc	tupdesc;
+		bool		is_immutable_null;
+
+		prepare_expr(cstate, expr, 0);
+		/* record all variables used by the query */
+		cstate->used_variables = bms_add_members(cstate->used_variables, expr->paramnos);
+
+		tupdesc = expr_get_desc(cstate, expr, false, true, true, NULL);
+		is_immutable_null = is_const_null_expr(cstate, expr);
+
+		if (tupdesc)
 		{
-			TupleDesc	tupdesc;
-			bool		is_immutable_null;
-
-			prepare_expr(cstate, expr, 0);
-			/* record all variables used by the query */
-			cstate->used_variables = bms_add_members(cstate->used_variables, expr->paramnos);
-
-			tupdesc = expr_get_desc(cstate, expr, false, true, true, NULL);
-			is_immutable_null = is_const_null_expr(expr);
-
-			if (tupdesc)
-			{
-				/* when we know value or type */
-				if (!is_immutable_null)
-					check_assign_to_target_type(cstate,
-									    expected_typoid, -1,
-									    tupdesc->attrs[0]->atttypid,
-									    is_immutable_null);
-			}
-
-			ReleaseTupleDesc(tupdesc);
-
-			RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(oldCxt);
-			CurrentResourceOwner = oldowner;
-
-			SPI_restore_connection();
+			/* when we know value or type */
+			if (!is_immutable_null)
+				check_assign_to_target_type(cstate,
+								    expected_typoid, -1,
+								    TupleDescAttr(tupdesc, 0)->atttypid,
+								    is_immutable_null);
 		}
-		PG_CATCH();
-		{
-			ErrorData  *edata;
 
-			MemoryContextSwitchTo(oldCxt);
-			edata = CopyErrorData();
-			FlushErrorState();
+		ReleaseTupleDesc(tupdesc);
 
-			RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(oldCxt);
-			CurrentResourceOwner = oldowner;
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldCxt);
+		CurrentResourceOwner = oldowner;
 
-			/*
-			 * If fatal_errors is true, we just propagate the error up to the
-			 * highest level. Otherwise the error is appended to our current list
-			 * of errors, and we continue checking.
-			 */
-			if (cstate->fatal_errors)
-				ReThrowError(edata);
-			else
-				put_error_edata(cstate, edata);
-			MemoryContextSwitchTo(oldCxt);
-
-			/* reconnect spi */
-			SPI_restore_connection();
-		}
-		PG_END_TRY();
+		SPI_restore_connection();
 	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldCxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldCxt);
+		CurrentResourceOwner = oldowner;
+
+		/*
+		 * If fatal_errors is true, we just propagate the error up to the
+		 * highest level. Otherwise the error is appended to our current list
+		 * of errors, and we continue checking.
+		 */
+		if (cstate->fatal_errors)
+			ReThrowError(edata);
+		else
+			put_error_edata(cstate, edata);
+		MemoryContextSwitchTo(oldCxt);
+
+		/* reconnect spi */
+		SPI_restore_connection();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -2730,19 +3931,21 @@ check_returned_expr(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr, bool is_expr
 	{
 		TupleDesc	tupdesc;
 		bool		is_immutable_null;
+		Oid			first_level_typ = InvalidOid;
 
 		prepare_expr(cstate, expr, 0);
 		/* record all variables used by the query */
 		cstate->used_variables = bms_add_members(cstate->used_variables, expr->paramnos);
 
-		tupdesc = expr_get_desc(cstate, expr, false, true, is_expression, NULL);
-		is_immutable_null = is_const_null_expr(expr);
+		tupdesc = expr_get_desc(cstate, expr, false, true, is_expression, &first_level_typ);
+		is_immutable_null = is_const_null_expr(cstate, expr);
 
 		if (tupdesc)
 		{
 			/* enforce check for trigger function - result must be composit */
 			if (func->fn_retistuple && is_expression 
-				    && !(type_is_rowtype(tupdesc->attrs[0]->atttypid) || tupdesc->natts > 1))
+						  && !(type_is_rowtype(TupleDescAttr(tupdesc, 0)->atttypid) ||
+							   type_is_rowtype(first_level_typ) || tupdesc->natts > 1))
 			{
 				/* but we should to allow NULL */
 				if (!is_immutable_null)
@@ -2778,7 +3981,7 @@ check_returned_expr(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr, bool is_expr
 				{
 					check_assign_to_target_type(cstate,
 									    func->fn_rettype, -1,
-									    tupdesc->attrs[0]->atttypid,
+									    TupleDescAttr(tupdesc, 0)->atttypid,
 									    is_immutable_null);
 				}
 			}
@@ -2863,7 +4066,7 @@ check_expr_as_rvalue(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr,
 		cstate->used_variables = bms_add_members(cstate->used_variables, expr->paramnos);
 
 		tupdesc = expr_get_desc(cstate, expr, use_element_type, expand, is_expression, &first_level_typoid);
-		is_immutable_null = is_const_null_expr(expr);
+		is_immutable_null = is_const_null_expr(cstate, expr);
 
 		if (expected_typoid != InvalidOid && type_is_rowtype(expected_typoid) && first_level_typoid != InvalidOid)
 		{
@@ -2896,18 +4099,18 @@ check_expr_as_rvalue(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr,
 
 			if (targetrow)
 			{
-				if (targetrow->nfields > tupdesc->natts)
+				if (RowGetValidFields(targetrow) > TupleDescNVatts(tupdesc))
 					put_error(cstate,
 								  0, 0,
-								  "too few attributies for target variables",
+								  "too few attributes for target variables",
 								  "There are more target variables than output columns in query.",
 						  "Check target variables in SELECT INTO statement.",
 								  PLPGSQL_CHECK_WARNING_OTHERS,
 								  0, NULL, NULL);
-				else if (targetrow->nfields < tupdesc->natts)
+				else if (RowGetValidFields(targetrow) < TupleDescNVatts(tupdesc))
 					put_error(cstate,
 								  0, 0,
-								  "too many attributies for target variables",
+								  "too many attributes for target variables",
 								  "There are less target variables than output columns in query.",
 						   "Check target variables in SELECT INTO statement",
 								  PLPGSQL_CHECK_WARNING_OTHERS,
@@ -2961,8 +4164,37 @@ no_other_check:
 static void
 check_expr_as_sqlstmt_nodata(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
 {
+	if (check_expr_as_sqlstmt(cstate, expr))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("query has no destination for result data")));
+}
+
+/*
+ * Check a SQL statement, should to return data
+ *
+ */
+static void
+check_expr_as_sqlstmt_data(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
+{
+	if (!check_expr_as_sqlstmt(cstate, expr))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("query does not return data")));
+}
+
+
+/*
+ * Check a SQL statement, can (not) returs data. Returns true
+ * when statement returns data - we are able to get tuple descriptor.
+ */
+static bool
+check_expr_as_sqlstmt(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
+{
 	ResourceOwner oldowner;
 	MemoryContext oldCxt = CurrentMemoryContext;
+	TupleDesc	tupdesc;
+	volatile bool result = false;
 
 	oldowner = CurrentResourceOwner;
 	BeginInternalSubTransaction(NULL);
@@ -2974,10 +4206,12 @@ check_expr_as_sqlstmt_nodata(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
 		/* record all variables used by the query */
 		cstate->used_variables = bms_add_members(cstate->used_variables, expr->paramnos);
 
-		if (expr_get_desc(cstate, expr, false, false, false, NULL))
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("query has no destination for result data")));
+		tupdesc = expr_get_desc(cstate, expr, false, false, false, NULL);
+		if (tupdesc)
+		{
+			result = true;
+			ReleaseTupleDesc(tupdesc);
+		}
 
 		RollbackAndReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldCxt);
@@ -3012,7 +4246,55 @@ check_expr_as_sqlstmt_nodata(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
 		SPI_restore_connection();
 	}
 	PG_END_TRY();
+
+	return result;
 }
+
+
+#if PG_VERSION_NUM >= 110000
+
+static void
+check_variable(PLpgSQL_checkstate *cstate, PLpgSQL_variable *var)
+{
+	/* leave quickly when var is not defined */
+	if (var == NULL)
+		return;
+
+	if (var->dtype == PLPGSQL_DTYPE_ROW)
+	{
+		PLpgSQL_row *row = (PLpgSQL_row *) var;
+		int		fnum;
+
+		for (fnum = 0; fnum < row->nfields; fnum++)
+		{
+			/* skip dropped columns */
+			if (row->varnos[fnum] < 0)
+				continue;
+
+			check_target(cstate, row->varnos[fnum], NULL, NULL);
+		}
+		record_variable_usage(cstate, row->dno, true);
+
+		return;
+	}
+
+	if (var->dtype == PLPGSQL_DTYPE_REC)
+	{
+		PLpgSQL_rec *rec = (PLpgSQL_rec *) var;
+
+		/*
+		 * There are no checks done on records currently; just record that the
+		 * variable is not unused.
+		 */
+		record_variable_usage(cstate, rec->dno, true);
+
+		return;
+	}
+
+	elog(ERROR, "unsupported dtype %d", var->dtype);
+}
+
+#endif
 
 /*
  * Check composed lvalue There is nothing to check on rec variables
@@ -3033,7 +4315,7 @@ check_row_or_rec(PLpgSQL_checkstate *cstate, PLpgSQL_row *row, PLpgSQL_rec *rec)
 
 			check_target(cstate, row->varnos[fnum], NULL, NULL);
 		}
-		record_variable_usage(cstate, row->dno);
+		record_variable_usage(cstate, row->dno, true);
 	}
 	else if (rec != NULL)
 	{
@@ -3041,7 +4323,7 @@ check_row_or_rec(PLpgSQL_checkstate *cstate, PLpgSQL_row *row, PLpgSQL_rec *rec)
 		 * There are no checks done on records currently; just record that the
 		 * variable is not unused.
 		 */
-		record_variable_usage(cstate, rec->dno);
+		record_variable_usage(cstate, rec->dno, true);
 	}
 }
 
@@ -3054,7 +4336,7 @@ check_target(PLpgSQL_checkstate *cstate, int varno, Oid *expected_typoid, int *e
 {
 	PLpgSQL_datum *target = cstate->estate->datums[varno];
 
-	record_variable_usage(cstate, varno);
+	record_variable_usage(cstate, varno, true);
 
 	switch (target->dtype)
 	{
@@ -3074,12 +4356,25 @@ check_target(PLpgSQL_checkstate *cstate, int varno, Oid *expected_typoid, int *e
 			{
 				PLpgSQL_rec *rec = (PLpgSQL_rec *) target;
 
-				if (rec->tupdesc != NULL)
+#if PG_VERSION_NUM >= 110000
+
+				if (rec->rectypeid != RECORDOID)
 				{
 					if (expected_typoid != NULL)
-						*expected_typoid = rec->tupdesc->tdtypeid;
+						*expected_typoid = rec->rectypeid;
 					if (expected_typmod != NULL)
-						*expected_typmod = rec->tupdesc->tdtypmod;
+						*expected_typmod = -1;
+				}
+				else
+
+#endif
+
+				if (recvar_tupdesc(rec) != NULL)
+				{
+					if (expected_typoid != NULL)
+						*expected_typoid = recvar_tupdesc(rec)->tdtypeid;
+					if (expected_typmod != NULL)
+						*expected_typmod = recvar_tupdesc(rec)->tdtypmod;
 				}
 				else
 				{
@@ -3128,7 +4423,7 @@ check_target(PLpgSQL_checkstate *cstate, int varno, Oid *expected_typoid, int *e
 				 * that because records don't have any predefined field
 				 * structure.
 				 */
-				if (!HeapTupleIsValid(rec->tup))
+				if (!HeapTupleIsValid(recvar_tuple(rec)))
 					ereport(ERROR,
 						  (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					errmsg("record \"%s\" is not assigned to tuple structure",
@@ -3139,7 +4434,7 @@ check_target(PLpgSQL_checkstate *cstate, int varno, Oid *expected_typoid, int *e
 				 * number of attributes in the tuple.  Note: disallow system
 				 * column names because the code below won't cope.
 				 */
-				fno = SPI_fnumber(rec->tupdesc, recfield->fieldname);
+				fno = SPI_fnumber(recvar_tupdesc(rec), recfield->fieldname);
 				if (fno <= 0)
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_COLUMN),
@@ -3147,10 +4442,10 @@ check_target(PLpgSQL_checkstate *cstate, int varno, Oid *expected_typoid, int *e
 									rec->refname, recfield->fieldname)));
 
 				if (expected_typoid)
-					*expected_typoid = SPI_gettypeid(rec->tupdesc, fno);
+					*expected_typoid = SPI_gettypeid(recvar_tupdesc(rec), fno);
 
 				if (expected_typmod)
-					*expected_typmod = rec->tupdesc->attrs[fno - 1]->atttypmod;
+					*expected_typmod = TupleDescAttr(recvar_tupdesc(rec), fno - 1)->atttypmod;
 			}
 			break;
 
@@ -3217,7 +4512,7 @@ check_target(PLpgSQL_checkstate *cstate, int varno, Oid *expected_typoid, int *e
 				if (expected_typmod)
 					*expected_typmod = ((PLpgSQL_var *) target)->datatype->atttypmod;
 
-				record_variable_usage(cstate, target->dno);
+				record_variable_usage(cstate, target->dno, true);
 			}
 			break;
 
@@ -3277,6 +4572,9 @@ prepare_expr(PLpgSQL_checkstate *cstate,
 			}
 		}
 
+		
+
+
 		/*
 		 * We would to check all plans, but when plan exists, then don't 
 		 * overwrite existing plan.
@@ -3293,6 +4591,14 @@ prepare_expr(PLpgSQL_checkstate *cstate,
 	/* Don't allow write plan when function is read only */
 	if (cstate->estate->readonly_func)
 		prohibit_write_plan(cstate, expr);
+
+	if (cstate->performance_warnings)
+		check_fishy_qual(cstate, expr);
+
+	check_seq_functions(cstate, expr);
+
+	if (cstate->format == PLPGSQL_SHOW_DEPENDENCY_FORMAT_TABULAR)
+		detect_dependency(cstate, expr);
 
 	prohibit_transaction_stmt(cstate, expr);
 }
@@ -3331,7 +4637,7 @@ check_assign_to_target_type(PLpgSQL_checkstate *cstate,
 					  PLPGSQL_CHECK_ERROR,
 					  0, NULL, NULL);
 
-	else if (target_typoid != value_typoid)
+	else if (target_typoid != value_typoid && !isnull)
 	{
 		StringInfoData	str;
 
@@ -3390,7 +4696,7 @@ assign_tupdesc_dno(PLpgSQL_checkstate *cstate, int varno, TupleDesc tupdesc, boo
 
 				check_assign_to_target_type(cstate,
 									 var->datatype->typoid, var->datatype->atttypmod,
-									 tupdesc->attrs[0]->atttypid,
+									 TupleDescAttr(tupdesc, 0)->atttypid,
 									 isnull);
 			}
 			break;
@@ -3415,22 +4721,22 @@ assign_tupdesc_dno(PLpgSQL_checkstate *cstate, int varno, TupleDesc tupdesc, boo
 				{
 					PLpgSQL_rec rec;
 
-					rec.tup = NULL;
-					rec.freetup = false;
-					rec.freetupdesc = false;
+					recval_init(&rec);
 
 					PG_TRY();
 					{
-						rec.tupdesc = lookup_rowtype_tupdesc_noerror(expected_typoid, expected_typmod, true);
-						assign_tupdesc_row_or_rec(cstate, NULL, &rec, tupdesc, isnull);
+						recval_assign_tupdesc(cstate, &rec,
+											  lookup_rowtype_tupdesc_noerror(expected_typoid,
+																			 expected_typmod,
+																			 true),
+																			 isnull);
 
-						if (rec.tupdesc)
-							ReleaseTupleDesc(rec.tupdesc);
+						assign_tupdesc_row_or_rec(cstate, NULL, &rec, tupdesc, isnull);
+						recval_release(&rec);
 					}
 					PG_CATCH();
 					{
-						if (rec.tupdesc)
-							ReleaseTupleDesc(rec.tupdesc);
+						recval_release(&rec);
 
 						PG_RE_THROW();
 					}
@@ -3439,7 +4745,7 @@ assign_tupdesc_dno(PLpgSQL_checkstate *cstate, int varno, TupleDesc tupdesc, boo
 				else
 					check_assign_to_target_type(cstate,
 									    expected_typoid, expected_typmod,
-									    tupdesc->attrs[0]->atttypid,
+									    TupleDescAttr(tupdesc, 0)->atttypid,
 									    isnull);
 			}
 			break;
@@ -3459,9 +4765,6 @@ assign_tupdesc_row_or_rec(PLpgSQL_checkstate *cstate,
 						  PLpgSQL_row *row, PLpgSQL_rec *rec,
 						  TupleDesc tupdesc, bool isnull)
 {
-	bool	   *nulls;
-	HeapTuple	tup;
-
 	if (tupdesc == NULL)
 	{
 		put_error(cstate,
@@ -3479,27 +4782,8 @@ assign_tupdesc_row_or_rec(PLpgSQL_checkstate *cstate,
 	{
 		PLpgSQL_rec *target = (PLpgSQL_rec *) (cstate->estate->datums[rec->dno]);
 
-		if (target->freetup)
-			heap_freetuple(target->tup);
-
-		if (rec->freetupdesc)
-			FreeTupleDesc(target->tupdesc);
-
-		/* initialize rec by NULLs */
-		nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
-		memset(nulls, true, tupdesc->natts * sizeof(bool));
-
-		target->tupdesc = CreateTupleDescCopy(tupdesc);
-		target->freetupdesc = true;
-
-		tup = heap_form_tuple(tupdesc, NULL, nulls);
-		if (HeapTupleIsValid(tup))
-		{
-			target->tup = tup;
-			target->freetup = true;
-		}
-		else
-			elog(ERROR, "cannot to build valid composite value");
+		recval_release(target);
+		recval_assign_tupdesc(cstate, target, tupdesc, isnull);
 	}
 
 	else if (row != NULL && tupdesc != NULL)
@@ -3514,7 +4798,7 @@ assign_tupdesc_row_or_rec(PLpgSQL_checkstate *cstate,
 			if (row->varnos[fnum] < 0)
 				continue;		/* skip dropped column in row struct */
 
-			while (anum < td_natts && tupdesc->attrs[anum]->attisdropped)
+			while (anum < td_natts && TupleDescAttr(tupdesc, anum)->attisdropped)
 				anum++;			/* skip dropped column in tuple */
 
 			if (anum < td_natts)
@@ -3559,19 +4843,329 @@ assign_tupdesc_row_or_rec(PLpgSQL_checkstate *cstate,
 	}
 }
 
+static bool
+detect_dependency_walker(Node *node, void *context)
+{
+	PLpgSQL_checkstate *cstate = (PLpgSQL_checkstate *) context;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+		ListCell *lc;
+
+		foreach(lc, query->rtable)
+		{
+			RangeTblEntry *rt = (RangeTblEntry *) lfirst(lc);
+
+			if (rt->rtekind == RTE_RELATION)
+			{
+				if (!bms_is_member(rt->relid, cstate->rel_oids))
+				{
+					tuplestore_put_dependency(cstate->tuple_store,
+											 cstate->tupdesc,
+											 "RELATION",
+											 rt->relid,
+											 get_namespace_name(get_rel_namespace(rt->relid)),
+											 get_rel_name(rt->relid),
+											 NULL);
+
+					cstate->rel_oids = bms_add_member(cstate->rel_oids, rt->relid);
+				}
+			}
+		}
+
+		return query_tree_walker((Query *) node,
+								 detect_dependency_walker,
+								 context, 0);
+	}
+
+	if (IsA(node, FuncExpr) )
+	{
+		FuncExpr *fexpr = (FuncExpr *) node;
+
+		if (get_func_namespace(fexpr->funcid) != PG_CATALOG_NAMESPACE)
+		{
+			if (!bms_is_member(fexpr->funcid, cstate->func_oids))
+			{
+				StringInfoData		str;
+				ListCell		   *lc;
+				int		i = 0;
+
+				initStringInfo(&str);
+				appendStringInfoChar(&str, '(');
+				foreach(lc, fexpr->args)
+				{
+					Node *expr = (Node *) lfirst(lc);
+
+					if (i++ > 0)
+						appendStringInfoChar(&str, ',');
+
+					appendStringInfoString(&str, format_type_be(exprType(expr)));
+				}
+				appendStringInfoChar(&str, ')');
+
+				tuplestore_put_dependency(cstate->tuple_store,
+										  cstate->tupdesc,
+										  "FUNCTION",
+										  fexpr->funcid,
+										  get_namespace_name(get_func_namespace(fexpr->funcid)),
+										  get_func_name(fexpr->funcid),
+										  str.data);
+
+				pfree(str.data);
+
+				cstate->func_oids = bms_add_member(cstate->func_oids, fexpr->funcid);
+			}
+		}
+	}
+
+	return expression_tree_walker(node, detect_dependency_walker, context);
+}
+
+static void
+detect_dependency(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
+{
+	Query	   *query;
+
+	query = ExprGetQuery(cstate, expr);
+	detect_dependency_walker((Node *) query, cstate);
+}
+
+
 /*
- * Returns true for entered NULL constant
+ * Expecting persistent oid of nextval, currval and setval functions.
+ * Ensured by regress tests.
+ */
+#define NEXTVAL_OID		1574
+#define CURRVAL_OID		1575
+#define SETVAL_OID		1576
+#define SETVAL2_OID		1765
+
+typedef struct 
+{
+	PLpgSQL_checkstate *cstate;
+	PLpgSQL_expr *query;
+} check_seq_functions_walker_params;
+
+/*
+ * When sequence related functions has constant oid parameter, then ensure, so
+ * this oid is related to some sequnce object.
  *
  */
 static bool
-is_const_null_expr(PLpgSQL_expr *query)
+check_seq_functions_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Query))
+	{
+		return query_tree_walker((Query *) node,
+								 check_seq_functions_walker,
+								 context, 0);
+	}
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr *fexpr = (FuncExpr *) node;
+		int		location = -1;
+
+		switch (fexpr->funcid)
+		{
+			case NEXTVAL_OID:
+			case CURRVAL_OID:
+			case SETVAL_OID:
+			case SETVAL2_OID:
+			{
+				Node *first_arg = linitial(fexpr->args);
+
+				location = fexpr->location;
+
+				if (first_arg && IsA(first_arg, Const))
+				{
+					Const *c = (Const *) first_arg;
+
+					if (c->consttype == REGCLASSOID && !c->constisnull)
+					{
+						Oid		classid;
+
+						if (c->location != -1)
+							location = c->location;
+
+						classid = DatumGetObjectId(c->constvalue);
+
+						if (get_rel_relkind(classid) != RELKIND_SEQUENCE)
+						{
+							char	message[1024];
+							check_seq_functions_walker_params *wp;
+
+							wp = (check_seq_functions_walker_params *) context;
+
+							snprintf(message, sizeof(message), "\"%s\" is not a sequence", get_rel_name(classid));
+
+							put_error(wp->cstate,
+										  ERRCODE_WRONG_OBJECT_TYPE, 0,
+										  message,
+										  NULL, NULL,
+										  PLPGSQL_CHECK_ERROR,
+										  location,
+										  wp->query->query, NULL);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return expression_tree_walker(node, check_seq_functions_walker, context);
+}
+
+/*
+ * Returns Query node for expression
+ *
+ */
+static Query *
+ExprGetQuery(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query)
 {
 	CachedPlanSource *plansource = NULL;
-	PlannedStmt *_stmt;
-	Plan	   *_plan;
-	TargetEntry *tle;
+	Query *result = NULL;
+
+	if (query->plan != NULL)
+	{
+		SPIPlanPtr	plan = query->plan;
+
+		if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC)
+			elog(ERROR, "cached plan is not valid plan");
+
+		if (list_length(plan->plancache_list) != 1)
+			elog(ERROR, "plan is not single execution plan");
+
+		plansource = (CachedPlanSource *) linitial(plan->plancache_list);
+
+		if (list_length(plansource->query_list) != 1)
+			elog(ERROR, "there is not single query");
+
+		result = linitial(plansource->query_list);
+	}
+
+	return result;
+}
+
+static void
+check_seq_functions(PLpgSQL_checkstate *cstate, PLpgSQL_expr *expr)
+{
+	Query	   *query;
+	check_seq_functions_walker_params  wp;
+
+	wp.cstate = cstate;
+	wp.query = expr;
+
+	query = ExprGetQuery(cstate, expr);
+	check_seq_functions_walker((Node *) query, &wp);
+}
+
+static bool
+contain_fishy_cast_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *opexpr = (OpExpr *) node;
+
+		if (!opexpr->opretset && opexpr->opresulttype == BOOLOID
+				&& list_length(opexpr->args) == 2)
+		{
+			Node *l1 = linitial(opexpr->args);
+			Node *l2 = lsecond(opexpr->args);
+			Param *param = NULL;
+			FuncExpr *fexpr = NULL;
+
+			if (IsA(l1, Param))
+				param = (Param *) l1;
+			else if (IsA(l1, FuncExpr))
+				fexpr = (FuncExpr *) l1;
+
+			if (IsA(l2, Param))
+				param = (Param *) l2;
+			else if (IsA(l2, FuncExpr))
+				fexpr = (FuncExpr *) l2;
+
+			if (param != NULL && fexpr != NULL)
+			{
+				if (param->paramkind != PARAM_EXTERN)
+					return false;
+
+				if (fexpr->funcformat != COERCE_IMPLICIT_CAST ||
+						fexpr->funcretset ||
+						list_length(fexpr->args) != 1 ||
+						param->paramtype != fexpr->funcresulttype)
+					return false;
+
+				if (!IsA(linitial(fexpr->args), Var))
+					return false;
+
+				*((Param **) context) = param;
+
+				return true;
+			}
+		}
+	}
+
+	return expression_tree_walker(node, contain_fishy_cast_walker, context);
+}
+
+/*
+ * Try to identify constraint where variable from one side is implicitly casted to
+ * parameter type of second side. It can symptom of parameter wrong type.
+ *
+ */
+static bool
+contain_fishy_cast(Node *node, Param **param)
+{
+	return contain_fishy_cast_walker(node, param);
+}
+
+static bool
+qual_has_fishy_cast(PlannedStmt *plannedstmt, Plan *plan, Param **param)
+{
+	ListCell *lc;
+
+	if (plan == NULL)
+		return false;
+
+	if (contain_fishy_cast((Node *) plan->qual, param))
+		return true;
+
+	if (qual_has_fishy_cast(plannedstmt, innerPlan(plan), param))
+		return true;
+	if (qual_has_fishy_cast(plannedstmt, outerPlan(plan), param))
+		return true;
+
+	foreach(lc, plan->initPlan)
+	{
+		SubPlan *subplan = (SubPlan *) lfirst(lc);
+		Plan *s_plan = exec_subplan_get_plan(plannedstmt, subplan);
+
+		if (qual_has_fishy_cast(plannedstmt, s_plan, param))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Common part of some expression based analyzes.
+ *
+ */
+static CachedPlan *
+ExprGetPlan(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query, bool *returns_result)
+{
+	CachedPlanSource *plansource = NULL;
 	CachedPlan *cplan;
-	bool	result = false;
 
 	if (query->plan != NULL)
 	{
@@ -3586,7 +5180,23 @@ is_const_null_expr(PLpgSQL_expr *query)
 		plansource = (CachedPlanSource *) linitial(plan->plancache_list);
 
 		if (!plansource->resultDesc)
-			elog(ERROR, "query returns no result");
+		{
+			bool		result_is_optional = false;
+
+#if PG_VERSION_NUM >= 110000
+
+			if (cstate->estate->err_stmt != NULL)
+				result_is_optional = cstate->estate->err_stmt->cmd_type == PLPGSQL_STMT_CALL;
+
+#endif
+
+			if (!result_is_optional)
+				elog(ERROR, "query returns no result");
+
+			*returns_result = false;
+		}
+		else
+			*returns_result = true;
 	}
 	else
 		elog(ERROR, "there are no plan for query: \"%s\"",
@@ -3597,21 +5207,250 @@ is_const_null_expr(PLpgSQL_expr *query)
 	 * plan if it is just function call and if it is then we can try to
 	 * derive a tupledes from function's description.
 	 */
+#if PG_VERSION_NUM >= 100000
+
+	cplan = GetCachedPlan(plansource, NULL, true, NULL);
+
+#else
+
 	cplan = GetCachedPlan(plansource, NULL, true);
+
+#endif
+
+	return cplan;
+}
+
+/*
+ * Returns Const Value from expression if it is possible.
+ *
+ */
+static Const *
+ExprGetConst(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query, bool *IsConst)
+{
+	PlannedStmt *_stmt;
+	Plan	   *_plan;
+	TargetEntry *tle;
+	CachedPlan *cplan;
+	Const	   *result = NULL;
+	bool		returns_result;
+
+	cplan = ExprGetPlan(cstate, query, &returns_result);
 	_stmt = (PlannedStmt *) linitial(cplan->stmt_list);
 
-	if (IsA(_stmt, PlannedStmt) &&_stmt->commandType == CMD_SELECT)
+	if (returns_result && IsA(_stmt, PlannedStmt) &&_stmt->commandType == CMD_SELECT)
 	{
 		_plan = _stmt->planTree;
 		if (IsA(_plan, Result) &&list_length(_plan->targetlist) == 1)
 		{
 			tle = (TargetEntry *) linitial(_plan->targetlist);
 			if (((Node *) tle->expr)->type == T_Const)
-				result = ((Const *) tle->expr)->constisnull;
+				result = (Const *) tle->expr;
 		}
 	}
 
+	*IsConst = result != NULL;
+
 	ReleaseCachedPlan(cplan, true);
+
+	return result;
+}
+
+#if PG_VERSION_NUM >= 110000
+
+/*
+ * compatible_tupdescs: detect whether two tupdescs are physically compatible
+ *
+ * TRUE indicates that a tuple satisfying src_tupdesc can be used directly as
+ * a value for a composite variable using dst_tupdesc.
+ */
+static bool
+compatible_tupdescs(TupleDesc src_tupdesc, TupleDesc dst_tupdesc)
+{
+	int			i;
+
+	/* Possibly we could allow src_tupdesc to have extra columns? */
+	if (dst_tupdesc->natts != src_tupdesc->natts)
+		return false;
+
+	for (i = 0; i < dst_tupdesc->natts; i++)
+	{
+		Form_pg_attribute dattr = TupleDescAttr(dst_tupdesc, i);
+		Form_pg_attribute sattr = TupleDescAttr(src_tupdesc, i);
+
+		if (dattr->attisdropped != sattr->attisdropped)
+			return false;
+		if (!dattr->attisdropped)
+		{
+			/* Normal columns must match by type and typmod */
+			if (dattr->atttypid != sattr->atttypid ||
+				(dattr->atttypmod >= 0 &&
+				 dattr->atttypmod != sattr->atttypmod))
+				return false;
+		}
+		else
+		{
+			/* Dropped columns are OK as long as length/alignment match */
+			if (dattr->attlen != sattr->attlen ||
+				dattr->attalign != sattr->attalign)
+				return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * Try to calculate row target from used INOUT variables
+ */
+static PLpgSQL_row *
+CallExprGetRowTarget(PLpgSQL_checkstate *cstate, PLpgSQL_expr *CallExpr)
+{
+	Node	   *node;
+	FuncExpr   *funcexpr;
+	PLpgSQL_row *result = NULL;
+
+	if (CallExpr->plan != NULL)
+	{
+		PLpgSQL_row *row;
+		SPIPlanPtr	plan = CallExpr->plan;
+		HeapTuple		tuple;
+		List	   *funcargs;
+		Oid		   *argtypes;
+		char	  **argnames;
+		char	   *argmodes;
+		ListCell   *lc;
+		int			i;
+		int			nfields = 0;
+
+		if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC)
+			elog(ERROR, "cached plan is not valid plan");
+
+		if (list_length(plan->plancache_list) != 1)
+			elog(ERROR, "plan is not single execution plan");
+
+		/*
+		 * Get the original CallStmt
+		 */
+		node = linitial_node(Query, ((CachedPlanSource *) linitial(plan->plancache_list))->query_list)->utilityStmt;
+		if (!IsA(node, CallStmt))
+			elog(ERROR, "returned row from not a CallStmt");
+
+		funcexpr = castNode(CallStmt, node)->funcexpr;
+
+		/*
+		 * Get the argument modes
+		 */
+		tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcexpr->funcid));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for function %u", funcexpr->funcid);
+
+		/* Extract function arguments, and expand any named-arg notation */
+		funcargs = expand_function_arguments(funcexpr->args,
+											 funcexpr->funcresulttype,
+											 tuple);
+
+		get_func_arg_info(tuple, &argtypes, &argnames, &argmodes);
+
+		ReleaseSysCache(tuple);
+
+		row = palloc0(sizeof(PLpgSQL_row));
+		row->dtype = PLPGSQL_DTYPE_ROW;
+		row->lineno = 0;
+		row->varnos = palloc(sizeof(int) * list_length(funcargs));
+
+		/*
+		 * Construct row
+		 */
+		i = 0;
+		foreach(lc, funcargs)
+		{
+			Node	   *n = lfirst(lc);
+
+			if (argmodes &&
+				(argmodes[i] == PROARGMODE_INOUT ||
+				 argmodes[i] == PROARGMODE_OUT))
+			{
+				if (IsA(n, Param))
+				{
+					Param	   *param = (Param *) n;
+
+					/* paramid is offset by 1 (see make_datum_param()) */
+					row->varnos[nfields++] = param->paramid - 1;
+				}
+				else
+				{
+					/* report error using parameter name, if available */
+					if (argnames && argnames[i] && argnames[i][0])
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("procedure parameter \"%s\" is an output parameter but corresponding argument is not writable",
+										argnames[i])));
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("procedure parameter %d is an output parameter but corresponding argument is not writable",
+										i + 1)));
+				}
+			}
+			i++;
+		}
+
+		row->nfields = nfields;
+
+		/* Don't return empty row variable */
+		if (nfields > 0)
+		{
+			result = row;
+		}
+		else
+		{
+			pfree(row->varnos);
+			pfree(row);
+		}
+	}
+	else
+		elog(ERROR, "there are no plan for query: \"%s\"",
+			 CallExpr->query);
+
+	return result;
+}
+
+#endif
+
+/*
+ * Returns true for entered NULL constant
+ *
+ */
+static bool
+is_const_null_expr(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query)
+{
+	Const	   *c;
+	bool		IsConst;
+
+	c = ExprGetConst(cstate, query, &IsConst);
+
+	return IsConst ? c->constisnull : false;
+}
+
+/*
+ * Returns string for any not null constant.
+ * When constant is NULL, then returns NULL.
+ *
+ */
+static char *
+ExprGetString(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query, bool *IsConst)
+{
+	Const	   *c;
+	char	   *result = NULL;
+
+	c = ExprGetConst(cstate, query, IsConst);
+	if (*IsConst && !c->constisnull)
+	{
+		Oid		typoutput;
+		bool	typisvarlena;
+
+		getTypeOutputInfo(c->consttype, &typoutput, &typisvarlena);
+		result = OidOutputFunctionCall(typoutput, c->constvalue);
+	}
 
 	return result;
 }
@@ -3681,13 +5520,13 @@ expr_get_desc(PLpgSQL_checkstate *cstate,
 							tupdesc->natts)));
 
 		/* check the type of the expression - must be an array */
-		elemtype = get_element_type(tupdesc->attrs[0]->atttypid);
+		elemtype = get_element_type(TupleDescAttr(tupdesc, 0)->atttypid);
 		if (!OidIsValid(elemtype))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
 				errmsg("FOREACH expression must yield an array, not type %s",
-					   format_type_be(tupdesc->attrs[0]->atttypid))));
+					   format_type_be(TupleDescAttr(tupdesc, 0)->atttypid))));
 			FreeTupleDesc(tupdesc);
 		}
 
@@ -3722,7 +5561,7 @@ expr_get_desc(PLpgSQL_checkstate *cstate,
 	else
 	{
 		if (is_expression && first_level_typoid != NULL)
-			*first_level_typoid = tupdesc->attrs[0]->atttypid;
+			*first_level_typoid = TupleDescAttr(tupdesc, 0)->atttypid;
 	}
 
 	/*
@@ -3735,8 +5574,8 @@ expr_get_desc(PLpgSQL_checkstate *cstate,
 	{
 		TupleDesc	unpack_tupdesc;
 
-		unpack_tupdesc = lookup_rowtype_tupdesc_noerror(tupdesc->attrs[0]->atttypid,
-												tupdesc->attrs[0]->atttypmod,
+		unpack_tupdesc = lookup_rowtype_tupdesc_noerror(TupleDescAttr(tupdesc, 0)->atttypid,
+												TupleDescAttr(tupdesc, 0)->atttypmod,
 														true);
 		if (unpack_tupdesc != NULL)
 		{
@@ -3759,8 +5598,8 @@ expr_get_desc(PLpgSQL_checkstate *cstate,
 	if (tupdesc->tdtypeid == RECORDOID &&
 		tupdesc->tdtypmod == -1 &&
 		tupdesc->natts == 1 &&
-		tupdesc->attrs[0]->atttypid == RECORDOID &&
-		tupdesc->attrs[0]->atttypmod == -1 &&
+		TupleDescAttr(tupdesc, 0)->atttypid == RECORDOID &&
+		TupleDescAttr(tupdesc, 0)->atttypmod == -1 &&
 		expand_record)
 	{
 		PlannedStmt *_stmt;
@@ -3773,12 +5612,21 @@ expr_get_desc(PLpgSQL_checkstate *cstate,
 		 * plan if it is just function call and if it is then we can try to
 		 * derive a tupledes from function's description.
 		 */
-		cplan = GetCachedPlan(plansource, NULL, true);
+#if PG_VERSION_NUM >= 100000
+
+	cplan = GetCachedPlan(plansource, NULL, true, NULL);
+
+#else
+
+	cplan = GetCachedPlan(plansource, NULL, true);
+
+#endif
 		_stmt = (PlannedStmt *) linitial(cplan->stmt_list);
 
 		if (IsA(_stmt, PlannedStmt) &&_stmt->commandType == CMD_SELECT)
 		{
 			_plan = _stmt->planTree;
+
 			if (IsA(_plan, Result) &&list_length(_plan->targetlist) == 1)
 			{
 				tle = (TargetEntry *) linitial(_plan->targetlist);
@@ -3840,6 +5688,25 @@ expr_get_desc(PLpgSQL_checkstate *cstate,
 						}
 						break;
 
+					case T_Const:
+						{
+							Const *c = (Const *) tle->expr;
+						
+							if (c->consttype == RECORDOID && c->consttypmod == -1)
+							{
+								Oid		tupType;
+								int32	tupTypmod;
+
+								HeapTupleHeader rec = DatumGetHeapTupleHeader(c->constvalue);
+								tupType = HeapTupleHeaderGetTypeId(rec);
+								tupTypmod = HeapTupleHeaderGetTypMod(rec);
+								tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+							}
+							else
+								tupdesc = NULL;
+						}
+						break;
+
 					default:
 							/* cannot to take tupdesc */
 							tupdesc = NULL;
@@ -3870,12 +5737,33 @@ prohibit_write_plan(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query)
 		elog(ERROR, "plan is not single execution plan");
 
 	plansource = (CachedPlanSource *) linitial(plan->plancache_list);
+
+#if PG_VERSION_NUM >= 100000
+
+	cplan = GetCachedPlan(plansource, NULL, true, NULL);
+
+#else
+
 	cplan = GetCachedPlan(plansource, NULL, true);
+
+#endif
+
 	stmt_list = cplan->stmt_list;
 
 	foreach(lc, stmt_list)
 	{
+
+#if PG_VERSION_NUM >= 100000
+
+		PlannedStmt *pstmt = (PlannedStmt *) lfirst(lc);
+
+		Assert(IsA(pstmt, PlannedStmt));
+
+#else
+
 		Node *pstmt = (Node *) lfirst(lc);
+
+#endif
 
 		if (!CommandIsReadOnly(pstmt))
 		{
@@ -3884,7 +5772,7 @@ prohibit_write_plan(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query)
 			initStringInfo(&message);
 			appendStringInfo(&message,
 					"%s is not allowed in a non volatile function",
-							CreateCommandTag(pstmt));
+							CreateCommandTag((Node *) pstmt));
 
 			put_error(cstate,
 					  ERRCODE_FEATURE_NOT_SUPPORTED, 0,
@@ -3921,7 +5809,17 @@ prohibit_transaction_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query)
 		elog(ERROR, "plan is not single execution plan");
 
 	plansource = (CachedPlanSource *) linitial(plan->plancache_list);
+
+#if PG_VERSION_NUM >= 100000
+
+	cplan = GetCachedPlan(plansource, NULL, true, NULL);
+
+#else
+
 	cplan = GetCachedPlan(plansource, NULL, true);
+
+#endif
+
 	stmt_list = cplan->stmt_list;
 
 	foreach(lc, stmt_list)
@@ -3944,25 +5842,103 @@ prohibit_transaction_stmt(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query)
 }
 
 /*
- * returns refname of PLpgSQL_datum
+ * Raise a performance warning when plan hash fishy qual
+ */
+static void
+check_fishy_qual(PLpgSQL_checkstate *cstate, PLpgSQL_expr *query)
+{
+	CachedPlanSource *plansource = NULL;
+	SPIPlanPtr	 plan = query->plan;
+	CachedPlan	*cplan;
+	List		*stmt_list;
+	ListCell	*lc;
+
+	if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC)
+		elog(ERROR, "cached plan is not valid plan");
+
+	if (list_length(plan->plancache_list) != 1)
+		elog(ERROR, "plan is not single execution plan");
+
+	plansource = (CachedPlanSource *) linitial(plan->plancache_list);
+
+#if PG_VERSION_NUM >= 100000
+
+	cplan = GetCachedPlan(plansource, NULL, true, NULL);
+
+#else
+
+	cplan = GetCachedPlan(plansource, NULL, true);
+
+#endif
+
+	stmt_list = cplan->stmt_list;
+
+	foreach(lc, stmt_list)
+	{
+		Param	*param;
+		PlannedStmt *pstmt = (PlannedStmt *) lfirst(lc);
+		Plan *plan = NULL;
+
+		Assert(IsA(pstmt, PlannedStmt));
+
+		plan = pstmt->planTree;
+
+		if (qual_has_fishy_cast(pstmt, plan, &param))
+		{
+			put_error(cstate,
+					  ERRCODE_DATATYPE_MISMATCH, 0,
+					  "implicit cast of attribute caused by different PLpgSQL variable type in WHERE clause",
+					  "An index of some attribute cannot be used, when variable, used in predicate, has not right type like a attribute",
+					  "Check a variable type - int versus numeric",
+					  PLPGSQL_CHECK_WARNING_PERFORMANCE,
+					  param->location,
+					  query->query, NULL);
+		}
+	}
+
+	ReleaseCachedPlan(cplan, true);
+}
+
+/*
+ * returns refname of PLpgSQL_datum. When refname is generated,
+ * then return null too, although refname is not null.
  */
 static char *
 datum_get_refname(PLpgSQL_datum *d)
 {
+	char	   *refname;
+	int			lineno;
+
 	switch (d->dtype)
 	{
 		case PLPGSQL_DTYPE_VAR:
-			return ((PLpgSQL_var *) d)->refname;
+			refname = ((PLpgSQL_var *) d)->refname;
+			lineno = ((PLpgSQL_var *) d)->lineno;
+			break;
 
 		case PLPGSQL_DTYPE_ROW:
-			return ((PLpgSQL_row *) d)->refname;
+			refname = ((PLpgSQL_row *) d)->refname;
+			lineno = ((PLpgSQL_row *) d)->lineno;
+			break;
 
 		case PLPGSQL_DTYPE_REC:
-			return ((PLpgSQL_rec *) d)->refname;
+			refname = ((PLpgSQL_rec *) d)->refname;
+			lineno = ((PLpgSQL_rec *) d)->lineno;
+			break;
 
 		default:
-			return NULL;
+			refname = NULL;
+			lineno = -1;
 	}
+
+	/*
+	 * PostgreSQL 12 started use "(unnamed row)" name for internal
+	 * variables. Hide this name too (lineno is -1).
+	 */
+	if (is_internal(refname, lineno))
+		return NULL;
+
+	return refname;
 }
 
 /****************************************************************************************
@@ -4016,6 +5992,10 @@ put_error(PLpgSQL_checkstate *cstate,
 					  const char *query,
 					  const char *context)
 {
+	/* In this case we would not to see a errors */
+	if (cstate->format == PLPGSQL_SHOW_DEPENDENCY_FORMAT_TABULAR)
+		return;
+
 	/* ignore warnings when is not requested */
 	if ((level == PLPGSQL_CHECK_WARNING_PERFORMANCE && !cstate->performance_warnings) ||
 			    (level == PLPGSQL_CHECK_WARNING_OTHERS && !cstate->other_warnings) ||
@@ -4028,28 +6008,28 @@ put_error(PLpgSQL_checkstate *cstate,
 		{
 			case PLPGSQL_CHECK_FORMAT_TABULAR:
 				tuplestore_put_error_tabular(cstate->tuple_store, cstate->tupdesc,
-								 cstate->estate, cstate->fn_oid,
+									 cstate->estate, cstate->fn_oid,
 									 sqlerrcode, lineno, message, detail,
 									 hint, level, position, query, context);
 				break;
 
 			case PLPGSQL_CHECK_FORMAT_TEXT:
 				tuplestore_put_error_text(cstate->tuple_store, cstate->tupdesc,
-								 cstate->estate, cstate->fn_oid,
+									 cstate->estate, cstate->fn_oid,
 									 sqlerrcode, lineno, message, detail,
 									 hint, level, position, query, context);
 				break;
 
 			case PLPGSQL_CHECK_FORMAT_XML:
 				format_error_xml(cstate->sinfo, cstate->estate,
-								 sqlerrcode, lineno, message, detail,
-								 hint, level, position, query, context);
+									 sqlerrcode, lineno, message, detail,
+									 hint, level, position, query, context);
 				break;
 
-		case PLPGSQL_CHECK_FORMAT_JSON:
-			format_error_json(cstate->sinfo, cstate->estate,
-				sqlerrcode, lineno, message, detail,
-				hint, level, position, query, context);
+			case PLPGSQL_CHECK_FORMAT_JSON:
+				format_error_json(cstate->sinfo, cstate->estate,
+									 sqlerrcode, lineno, message, detail,
+									 hint, level, position, query, context);
 			break;
 		}
 	}
@@ -4097,6 +6077,32 @@ error_level_str(int level)
 }
 
 /*
+ * store dependency fields to result tuplestore
+ *
+ */
+static void
+tuplestore_put_dependency(Tuplestorestate *tuple_store,
+						  TupleDesc tupdesc,
+						  char *type,
+						  Oid oid,
+						  char *schema,
+						  char *name,
+						  char *params)
+{
+	Datum	values[Natts_dependency];
+	bool	nulls[Natts_dependency];
+
+	SET_RESULT_TEXT(Anum_dependency_type, type);
+	SET_RESULT_OID(Anum_dependency_oid, oid);
+	SET_RESULT_TEXT(Anum_dependency_schema, schema);
+	SET_RESULT_TEXT(Anum_dependency_name, name);
+	SET_RESULT_TEXT(Anum_dependency_params, params);
+
+	tuplestore_putvalues(tuple_store, tupdesc, values, nulls);
+}
+
+
+/*
  * store error fields to result tuplestore
  *
  */
@@ -4133,6 +6139,12 @@ tuplestore_put_error_tabular(Tuplestorestate *tuple_store, TupleDesc tupdesc,
 		SET_RESULT_INT32(Anum_result_lineno, lineno);
 		SET_RESULT_TEXT(Anum_result_statement, "DECLARE");
 	}
+	else if (strncmp(message, NEVER_READ_VARIABLE_TEXT, NEVER_READ_VARIABLE_TEXT_CHECK_LENGTH) == 0)
+	{
+		SET_RESULT_INT32(Anum_result_lineno, lineno);
+		SET_RESULT_TEXT(Anum_result_statement, "DECLARE");
+	}
+
 	else
 	{
 		SET_RESULT_NULL(Anum_result_lineno);
@@ -4155,6 +6167,7 @@ tuplestore_put_error_tabular(Tuplestorestate *tuple_store, TupleDesc tupdesc,
 
 	tuplestore_putvalues(tuple_store, tupdesc, values, nulls);
 }
+
 
 /*
  * collects errors and warnings in plain text format
@@ -4189,6 +6202,15 @@ tuplestore_put_error_text(Tuplestorestate *tuple_store, TupleDesc tupdesc,
 			    plpgsql_stmt_typename(estate->err_stmt),
 				 message);
 	else if (strncmp(message, UNUSED_VARIABLE_TEXT, UNUSED_VARIABLE_TEXT_CHECK_LENGTH) == 0)
+	{
+		appendStringInfo(&sinfo, "%s:%s:%d:%s:%s",
+				 level_str,
+				 unpack_sql_state(sqlerrcode),
+				 lineno,
+				 "DECLARE",
+				 message);
+	}
+	else if (strncmp(message, NEVER_READ_VARIABLE_TEXT, NEVER_READ_VARIABLE_TEXT_CHECK_LENGTH) == 0)
 	{
 		appendStringInfo(&sinfo, "%s:%s:%d:%s:%s",
 				 level_str,
@@ -4335,7 +6357,7 @@ format_error_xml(StringInfo str,
 						 unpack_sql_state(sqlerrcode));
 	appendStringInfo(str, "    <Message>%s</Message>\n",
 							 escape_xml(message));
-	if (estate->err_stmt != NULL)
+	if (estate != NULL && estate->err_stmt != NULL)
 		appendStringInfo(str, "    <Stmt lineno=\"%d\">%s</Stmt>\n",
 				 estate->err_stmt->lineno,
 			   plpgsql_stmt_typename(estate->err_stmt));
@@ -4391,7 +6413,7 @@ format_error_json(StringInfo str,
 		
 	escape_json(&sinfo, message);
 	appendStringInfo(str, "    \"message\":%s,\n", sinfo.data);
-	if (estate->err_stmt != NULL)
+	if (estate != NULL && estate->err_stmt != NULL)
 		appendStringInfo(str, "    \"statement\":{\n\"lineNumber\":\"%d\",\n\"text\":\"%s\"\n},\n",
 			estate->err_stmt->lineno,
 			plpgsql_stmt_typename(estate->err_stmt));
@@ -4472,7 +6494,8 @@ tuplestore_put_text_line(Tuplestorestate *tuple_store, TupleDesc tupdesc,
 /*
  * routines for beginning and finishing function checking
  *
-* it is used primary for XML & JSON format - create almost left and almost right tag per function
+ * it is used primary for XML & JSON format - create almost left
+ * and almost right tag per function
  *
  */
 static void
@@ -4588,4 +6611,73 @@ mark_as_checked(PLpgSQL_function *func)
 
 		hentry->is_checked = true;
 	}
+}
+
+/*
+ * plpgsql_show_dependency_tb
+ *
+ * Prepare tuplestore and start check function in mode dependency detection
+ *
+ */
+Datum
+plpgsql_show_dependency_tb(PG_FUNCTION_ARGS)
+{
+	Oid			funcoid = PG_GETARG_OID(0);
+	Oid			relid = PG_GETARG_OID(1);
+	TupleDesc	tupdesc;
+	HeapTuple	procTuple;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	PLpgSQL_trigtype trigtype;
+	ErrorContextCallback *prev_errorcontext;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	procTuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+	if (!HeapTupleIsValid(procTuple))
+		elog(ERROR, "cache lookup failed for function %u", funcoid);
+
+	trigtype = get_trigtype(procTuple);
+	precheck_conditions(procTuple, trigtype, relid);
+
+	/* need to build tuplestore in query context */
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
+	tupstore = tuplestore_begin_heap(false, false, work_mem);
+	MemoryContextSwitchTo(oldcontext);
+
+	prev_errorcontext = error_context_stack;
+
+	/* Envelope outer plpgsql function is not interesting */
+	error_context_stack = NULL;
+
+	check_plpgsql_function(procTuple, relid, trigtype,
+							   tupdesc, tupstore,
+							   PLPGSQL_SHOW_DEPENDENCY_FORMAT_TABULAR,
+								   false, false, false, false);
+	error_context_stack = prev_errorcontext;
+
+	ReleaseSysCache(procTuple);
+
+	/* clean up and return the tuplestore */
+	tuplestore_donestoring(tupstore);
+
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	return (Datum) 0;
 }

@@ -12,12 +12,24 @@ If you like it and if you would to join to development of this extension, regist
 yourself to [postgresql extension hacking](https://groups.google.com/forum/#!forum/postgresql-extensions-hacking)
 google group.
 
+# Features
+
+* check fields of referenced database objects and types inside embedded SQL
+* using correct types of function parameters
+* unused variables and function argumens, unmodified OUT argumens
+* partially detection of dead code (due RETURN command)
+* detection of missing RETURN command in function
+* try to identify unwanted hidden casts, that can be performance issue like unused indexes
+* possibility to collect relations and functions used by function
+
 I invite any ideas, patches, bugreports
 
 plpgsql_check is next generation of plpgsql_lint. It allows to check source code by explicit call
 <i>plpgsql_check_function</i>.
 
-PostgreSQL 9.2 is required, PostgreSQL 9.3, 9.4, 9.5 and 9.6 are supported
+PostgreSQL PostgreSQL 9.4, 9.5, 9.6, 10, 11 are supported (Develop 12 is supported too).
+
+PostgreSQL 9.3 is compileable, but regress tests are not maintained.
 
 The SQL statements inside PL/pgSQL functions are checked by validator for semantic errors. These errors
 can be found by plpgsql_check_function:
@@ -111,6 +123,23 @@ Function plpgsql_check_function() has two possible formats: text or xml
       </Function>
      (1 row)
 
+## Options
+
+You can set level of warnings via function's parameters:
+
+* `fatal_errors boolean DEFAULT true` - stop on first error
+
+* `other_warnings boolean DEFAULT true` - show warnings like different attributes number
+  in assignmenet on left and right side, variable overlaps function's parameter, unused
+  variables, unwanted casting, ..
+
+* `extra_warnings boolean DEFAULT true` - show warnings like missing `RETURN`,
+  shadowed variables, dead code, never read (unused) function's parameter,
+  unmodified variables, ..
+
+* `performance_warnings boolean DEFAULT false` - performance related warnings like
+  declared type with type modificator, casting, implicit casts in where clause (can be
+  reason why index is not used), ..
 
 ## Triggers
 
@@ -155,6 +184,16 @@ triggers. Please, test following queries:
        JOIN pg_catalog.pg_proc p ON pronamespace = n.oid
        JOIN pg_catalog.pg_language l ON p.prolang = l.oid
       WHERE l.lanname = 'plpgsql' AND p.prorettype <> 2279;
+
+or
+
+    SELECT p.proname, tgrelid::regclass, cf.*
+       FROM pg_proc p
+            JOIN pg_trigger t ON t.tgfoid = p.oid 
+            JOIN pg_language l ON p.prolang = l.oid
+            JOIN pg_namespace n ON p.pronamespace = n.oid,
+            LATERAL plpgsql_check_function(p.oid, t.tgrelid) cf
+      WHERE n.nspname = 'public' and l.lanname = 'plpgsql'
 
 or
 
@@ -297,6 +336,22 @@ tables. So you can do (with following trick safetly):
 This trick emulates GLOBAL TEMP tables partially and it allows a statical validation.
 Other possibility is using a [template foreign data wrapper] (https://github.com/okbob/template_fdw)
 
+# Dependency list
+
+A function <i>plpgsql_show_dependency_tb</i> can show all functions and relations used
+inside processed function:
+
+    postgres=# select * from plpgsql_show_dependency_tb('testfunc(int,float)');
+    ┌──────────┬───────┬────────┬─────────┬────────────────────────────┐
+    │   type   │  oid  │ schema │  name   │           params           │
+    ╞══════════╪═══════╪════════╪═════════╪════════════════════════════╡
+    │ FUNCTION │ 36008 │ public │ myfunc1 │ (integer,double precision) │
+    │ FUNCTION │ 35999 │ public │ myfunc2 │ (integer,double precision) │
+    │ RELATION │ 36005 │ public │ myview  │                            │
+    │ RELATION │ 36002 │ public │ mytable │                            │
+    └──────────┴───────┴────────┴─────────┴────────────────────────────┘
+    (4 rows)
+
 # Compilation
 
 You need a development environment for PostgreSQL extensions:
@@ -387,12 +442,13 @@ or compile by self:
   1. copy `plpgsql_check.dll` to `PostgreSQL\9.3\lib`
   2. copy `plpgsql_check.control` and `plpgsql_check--0.8.sql` to `PostgreSQL\9.3\share\extension`
 
-
 ## Checked on
 
 * gcc on Linux (against all supported PostgreSQL)
 * clang 3.4 on Linux (against PostgreSQL 9.5)
-* for success regress tests the PostgreSQL 9.2.14, 9.3.10, 9.4.5, 9.5 or 9.6 is required.
+* for success regress tests the PostgreSQL 9.3.10, 9.4.5, 9.5 or higher is required
+
+Compilation against PostgreSQL 10 requires libICU!
 
 # Licence
 
